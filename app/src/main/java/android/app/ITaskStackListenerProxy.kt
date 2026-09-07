@@ -13,14 +13,33 @@ import java.lang.reflect.Method
 object ITaskStackListenerProxy {
     val byteBuddyStrategy = AndroidClassLoadingStrategy.Wrapping(File("/data/system/reYAMF").also { it.mkdirs() })
 
+    /**
+     * Optional observer used by BetterYAMF's own window registry. The platform task listener is
+     * shared by legacy virtual-display windows and native-freeform windows, so observing removals
+     * here avoids relying on displayId as a window identity (native freeform always uses display 0).
+     */
+    @Volatile
+    var taskRemovalObserver: ((Int) -> Unit)? = null
+
     private fun normalizeArguments(method: Method, allArguments: Array<Any?>): Array<Any?> {
-        // Android 12+ exposes onTaskRemovalStarted(RunningTaskInfo), while older
-        // code paths (and YAMFManager) consume the legacy taskId form. Some ROMs
-        // still dispatch the legacy signature, so keep this normalization tolerant.
-        if (method.name == "onTaskRemovalStarted") {
-            val taskInfo = allArguments.firstOrNull() as? ActivityManager.RunningTaskInfo
-            if (taskInfo != null) {
-                return arrayOf(taskInfo.taskId)
+        if (method.name == "onTaskRemovalStarted" || method.name == "onTaskRemoved") {
+            val first = allArguments.firstOrNull()
+            val taskId = when (first) {
+                is ActivityManager.RunningTaskInfo -> first.taskId
+                is Number -> first.toInt()
+                else -> null
+            }
+
+            if (taskId != null) {
+                // Never let an optional observer break the system Binder callback.
+                runCatching { taskRemovalObserver?.invoke(taskId) }
+            }
+
+            // Android 12+ exposes onTaskRemovalStarted(RunningTaskInfo), while the existing
+            // YAMFManager callback consumes the legacy taskId form. Normalize only that callback;
+            // onTaskRemoved already carries an int and is left untouched for ROM compatibility.
+            if (method.name == "onTaskRemovalStarted" && first is ActivityManager.RunningTaskInfo) {
+                return arrayOf(first.taskId)
             }
         }
         return allArguments
