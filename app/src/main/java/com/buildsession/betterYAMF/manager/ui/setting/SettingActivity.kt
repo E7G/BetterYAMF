@@ -78,7 +78,6 @@ class SettingActivity : AppCompatActivity() {
                     }
                     .show()
             }
-
             btnFlags.setOnClickListener {
                 val checks = BooleanArray(flags.size) { i ->
                     config.flags and (1 shl i) != 0
@@ -112,7 +111,7 @@ class SettingActivity : AppCompatActivity() {
             }
             btnSurface.setOnClickListener {
                 PopupMenu(this@SettingActivity, btnSurface).apply {
-                    listOf("Texture View", "Surface View").forEach { i ->
+                    listOf("Surface View", "Texture View").forEach { i ->
                         menu.add(i).setOnMenuItemClickListener {
                             btnSurface.text = i
                             true
@@ -183,8 +182,8 @@ class SettingActivity : AppCompatActivity() {
                 "${config.animationSpeed.toFloat()}"
             }
             btnSurface.text = when (config.surfaceView) {
-                0 -> "Texture View"
-                1 -> "Surface View"
+                0 -> "Surface View"
+                1 -> "Texture View"
                 else -> {
                     Log.d("reYAMF", "surfaceView: ${config.surfaceView}")
                     "Unavailable"
@@ -213,10 +212,10 @@ class SettingActivity : AppCompatActivity() {
             config.reduceDPI = etReduceDPI.text.toString().toIntOrNull() ?: config.reduceDPI
             config.flags = btnFlags.text.toString().toIntOrNull() ?: config.flags
             config.surfaceView = when (val surface = btnSurface.text.toString()) {
-                "Texture View" -> {
+                "Surface View" -> {
                     0
                 }
-                "Surface View" -> {
+                "Texture View" -> {
                     1
                 }
                 else -> {
