@@ -108,9 +108,6 @@ dependencies {
     //glide
     implementation (libs.glide)
 
-    // byte buddy
-    implementation(libs.byte.buddy.android)
-
     //lifecycle service
     implementation(libs.androidx.lifecycle.service)
 
