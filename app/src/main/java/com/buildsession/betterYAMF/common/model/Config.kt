@@ -1,6 +1,7 @@
 package com.buildsession.betterYAMF.common.model
 
 data class Config(
+    var schemaVersion: Int = 1,
     var reduceDPI: Int = 50,
     /*
      * VIRTUAL_DISPLAY_FLAG_SECURE                          1 << 2
@@ -17,10 +18,10 @@ data class Config(
     */
     var windowfy: Int = 0,
     /*
-     * 0: TextureView
-     * 1: SurfaceView
+     * 0: SurfaceView (lower latency, recommended)
+     * 1: TextureView (compatibility fallback)
     */
-    var surfaceView: Int = 1,
+    var surfaceView: Int = 0,
     /*
      * 0: Virtual Display (Legacy)
      * 1: Native Freeform (Smooth)
