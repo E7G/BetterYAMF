@@ -89,7 +89,7 @@ object WindowUiFixes {
         })
         XposedBridge.hookAllMethods(AppWindow::class.java, "onDestroy", object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
-                trackedWindows.remove(param.thisObject as? AppWindow)
+                (param.thisObject as? AppWindow)?.let(trackedWindows::remove)
             }
         })
     }
