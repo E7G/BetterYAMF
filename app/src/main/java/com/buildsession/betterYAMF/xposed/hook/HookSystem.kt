@@ -3,12 +3,10 @@ package com.buildsession.betterYAMF.xposed.hook
 import android.content.Intent
 import android.content.pm.IPackageManager
 import android.os.Build
-import android.util.Log
 import com.github.kyuubiran.ezxhelper.init.EzXHelperInit
 import com.github.kyuubiran.ezxhelper.utils.findMethod
 import com.github.kyuubiran.ezxhelper.utils.hookAfter
 import com.github.kyuubiran.ezxhelper.utils.hookBefore
-import com.buildsession.betterYAMF.BuildConfig
 import com.buildsession.betterYAMF.common.gson
 import com.buildsession.betterYAMF.xposed.services.UserService
 import com.buildsession.betterYAMF.xposed.services.YAMFManager
@@ -39,23 +37,23 @@ class HookSystem : IXposedHookZygoteInit, IXposedHookLoadPackage {
         EzXHelperInit.initHandleLoadPackage(lpparam)
         Initiator.init(lpparam.classLoader)
 
-        // Android 17/API 37 safety mode:
-        // - no Smooth Native Freeform WMS hooks
-        // - no WindowUiFixes smooth-bounds hook
-        // Legacy VirtualDisplay still keeps the direct AppWindow HyperOS-like gestures.
+        // The UI fixes now contain only conservative config/icon handling and are safe on API 37.
+        runCatching {
+            WindowUiFixes.init()
+        }.onFailure {
+            log(TAG, "WindowUiFixes init failed, continuing without optional UI fixes", it)
+        }
+
+        // Android 17/API 37: do not install Smooth Native Freeform WMS hooks.
+        // Legacy VirtualDisplay keeps AppWindow's direct HyperOS-like drag/swipe/resize gestures.
         if (Build.VERSION.SDK_INT < API_37) {
             runCatching {
                 FreeformHook.init(lpparam.classLoader)
             }.onFailure {
                 log(TAG, "FreeformHook init failed, but continuing for legacy support", it)
             }
-            runCatching {
-                WindowUiFixes.init()
-            }.onFailure {
-                log(TAG, "WindowUiFixes init failed, continuing without optional UI fixes", it)
-            }
         } else {
-            XposedBridge.log("$TAG: API ${Build.VERSION.SDK_INT}: using safe legacy mode; native-freeform hooks disabled")
+            XposedBridge.log("$TAG: API ${Build.VERSION.SDK_INT}: safe legacy mode; native-freeform hooks disabled")
         }
 
          var serviceManagerHook: XC_MethodHook.Unhook? = null
@@ -83,8 +81,8 @@ class HookSystem : IXposedHookZygoteInit, IXposedHookLoadPackage {
             YAMFManager.activityManagerService = it.thisObject
             YAMFManager.systemReady()
 
-            // A saved Smooth Native Freeform selection from an older build must not reactivate the
-            // unsafe API 37 path. Persist the fallback before any window can be opened.
+            // An older saved Smooth Native Freeform selection must not reactivate the unsafe API 37
+            // path. Persist VirtualDisplay mode before any window is opened.
             if (Build.VERSION.SDK_INT >= API_37 && YAMFManager.config.windowMode != 0) {
                 YAMFManager.config.windowMode = 0
                 runCatching {
