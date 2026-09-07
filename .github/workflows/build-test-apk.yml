@@ -1,0 +1,83 @@
+name: Build BetterYAMF Test APK
+
+on:
+  push:
+    branches:
+      - perf/native-window-ux
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Configure Gradle proxy
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          from urllib.parse import urlparse
+          proxy = os.environ.get('HTTPS_PROXY') or os.environ.get('https_proxy') or os.environ.get('HTTP_PROXY') or os.environ.get('http_proxy')
+          if not proxy:
+              print('No proxy environment found; continuing without JVM proxy settings')
+              raise SystemExit(0)
+          p = urlparse(proxy)
+          host = p.hostname
+          port = p.port or (443 if p.scheme == 'https' else 80)
+          gradle_dir = os.path.expanduser('~/.gradle')
+          os.makedirs(gradle_dir, exist_ok=True)
+          props = os.path.join(gradle_dir, 'gradle.properties')
+          lines = [
+              f'systemProp.http.proxyHost={host}',
+              f'systemProp.http.proxyPort={port}',
+              f'systemProp.https.proxyHost={host}',
+              f'systemProp.https.proxyPort={port}',
+          ]
+          if p.username:
+              lines += [
+                  f'systemProp.http.proxyUser={p.username}',
+                  f'systemProp.https.proxyUser={p.username}',
+              ]
+          if p.password:
+              lines += [
+                  f'systemProp.http.proxyPassword={p.password}',
+                  f'systemProp.https.proxyPassword={p.password}',
+              ]
+          with open(props, 'a', encoding='utf-8') as f:
+              f.write('\n' + '\n'.join(lines) + '\n')
+          print(f'Configured JVM proxy host {host}:{port}')
+          PY
+
+      - name: Build debug APK
+        run: gradle :app:assembleDebug --stacktrace --no-daemon
+
+      - name: Collect APK
+        run: |
+          mkdir -p out
+          cp app/build/outputs/apk/debug/*.apk out/BetterYAMF-native-window-ux-debug.apk
+          sha256sum out/*.apk | tee out/SHA256SUMS.txt
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: BetterYAMF-native-window-ux-debug
+          path: out/*
+          if-no-files-found: error
+          retention-days: 14
