@@ -2,7 +2,6 @@ package com.buildsession.betterYAMF.xposed.utils
 
 import android.animation.Animator
 import android.animation.AnimatorListenerAdapter
-import android.animation.AnimatorSet
 import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.app.ActivityOptions
@@ -15,9 +14,6 @@ import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.IPackageManagerHidden
 import android.content.res.Resources
-import android.graphics.RenderEffect
-import android.graphics.Shader
-import android.os.Build
 import android.os.Bundle
 import android.os.UserHandle
 import android.os.VibrationEffect
@@ -25,26 +21,16 @@ import android.os.Vibrator
 import android.provider.Settings
 import android.util.TypedValue
 import android.view.View
-import android.view.animation.AccelerateDecelerateInterpolator
-import android.view.animation.AlphaAnimation
-import android.view.animation.Animation
-import android.view.animation.ScaleAnimation
-import android.widget.ImageView
-import android.widget.LinearLayout
-import com.bumptech.glide.Glide
-import com.bumptech.glide.load.resource.bitmap.CenterCrop
-import com.bumptech.glide.load.resource.drawable.DrawableTransitionOptions
+import android.view.animation.DecelerateInterpolator
 import com.github.kyuubiran.ezxhelper.utils.argTypes
 import com.github.kyuubiran.ezxhelper.utils.args
 import com.github.kyuubiran.ezxhelper.utils.invokeMethod
 import com.github.kyuubiran.ezxhelper.utils.newInstance
-import com.buildsession.betterYAMF.common.gson
 import com.buildsession.betterYAMF.common.model.StartCmd
 import com.buildsession.betterYAMF.common.onException
-import com.buildsession.betterYAMF.manager.services.YAMFManagerProxy
 import com.buildsession.betterYAMF.xposed.services.YAMFManager
 import de.robv.android.xposed.XposedBridge
-import com.buildsession.betterYAMF.common.model.Config as YAMFConfig
+import kotlin.math.roundToInt
 
 fun log(tag: String, message: String) {
     XposedBridge.log("[$tag] $message")
@@ -146,8 +132,7 @@ fun StartCmd.startAuto(displayId: Int) {
 
 fun getTopRootTask(displayId: Int): ActivityTaskManager.RootTaskInfo? {
     Instances.activityTaskManager.getAllRootTaskInfosOnDisplay(displayId).forEach { task ->
-        if (task.visible)
-            return task
+        if (task.visible) return task
     }
     return null
 }
@@ -157,9 +142,10 @@ fun Context.registerReceiver(action: String, onReceive: BroadcastReceiver.(Conte
         override fun onReceive(context: Context, intent: Intent) {
             onReceive(this, context, intent)
         }
-    }, android.content.IntentFilter(action), Context.RECEIVER_EXPORTED)
+    }, IntentFilterCompat(action), Context.RECEIVER_EXPORTED)
 }
 
+private fun IntentFilterCompat(action: String) = android.content.IntentFilter(action)
 
 val ActivityInfo.componentName: ComponentName
     get() = ComponentName(packageName, name)
@@ -170,6 +156,20 @@ fun IPackageManagerHidden.getActivityInfoCompat(className: ComponentName, flags:
 fun vibratePhone(context: Context) {
     val vibrator = context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
     vibrator.vibrate(VibrationEffect.createOneShot(5, VibrationEffect.DEFAULT_AMPLITUDE))
+}
+
+private fun animationDuration(context: Context, fallbackDuration: Long): Long {
+    val systemScale = runCatching {
+        Settings.Global.getFloat(
+            context.contentResolver,
+            Settings.Global.ANIMATOR_DURATION_SCALE,
+            1f
+        )
+    }.getOrDefault(1f).coerceAtLeast(0f)
+
+    val configured = runCatching { YAMFManager.config.animationSpeed }.getOrDefault(5100f)
+    val base = if (configured < 5100f) configured.toLong().coerceAtLeast(0L) else fallbackDuration
+    return (base * systemScale).roundToInt().toLong()
 }
 
 fun animateResize(
@@ -183,45 +183,35 @@ fun animateResize(
     onUpdate: ((width: Int, height: Int) -> Unit)? = null,
     onEnd: (() -> Unit)? = null
 ) {
-    val scale = try {
-        Settings.Global.getFloat(context.contentResolver, Settings.Global.ANIMATOR_DURATION_SCALE)
-    } catch (e: Settings.SettingNotFoundException) {
-        1.0f // fallback to normal scale if not found
-    }
+    val duration = animationDuration(context, baseDuration)
+    val layoutParams = view.layoutParams
 
-    val config = try {
-        gson.fromJson(YAMFManagerProxy.configJson, YAMFConfig::class.java)
-    } catch (e: Exception) {
-        gson.fromJson(YAMFManager.configJson, YAMFConfig::class.java)
-    }
-    val adjustedDuration = (if (config.animationSpeed < 5100) config.animationSpeed else 300).toLong()
-
-    val widthAnimator = ValueAnimator.ofInt(startWidth, endWidth).apply {
-        addUpdateListener { animator ->
-            val value = animator.animatedValue as Int
-            val params = view.layoutParams
-            params.width = value
-            view.layoutParams = params
-            onUpdate?.invoke(value, view.layoutParams.height)
+    fun applyFrame(fraction: Float) {
+        val width = (startWidth + (endWidth - startWidth) * fraction).roundToInt()
+        val height = (startHeight + (endHeight - startHeight) * fraction).roundToInt()
+        if (layoutParams.width != width || layoutParams.height != height) {
+            layoutParams.width = width
+            layoutParams.height = height
+            // Width and height are committed together so each animation frame causes
+            // at most one layout pass instead of two independent passes.
+            view.layoutParams = layoutParams
         }
+        onUpdate?.invoke(width, height)
     }
 
-    val heightAnimator = ValueAnimator.ofInt(startHeight, endHeight).apply {
-        addUpdateListener { animator ->
-            val value = animator.animatedValue as Int
-            val params = view.layoutParams
-            params.height = value
-            view.layoutParams = params
-            onUpdate?.invoke(view.layoutParams.width, value)
-        }
+    if (duration <= 0L || (startWidth == endWidth && startHeight == endHeight)) {
+        applyFrame(1f)
+        onEnd?.invoke()
+        return
     }
 
-    AnimatorSet().apply {
-        playTogether(widthAnimator, heightAnimator)
-        duration = adjustedDuration
-        interpolator = AccelerateDecelerateInterpolator()
+    ValueAnimator.ofFloat(0f, 1f).apply {
+        this.duration = duration
+        interpolator = DecelerateInterpolator()
+        addUpdateListener { applyFrame(it.animatedFraction) }
         addListener(object : AnimatorListenerAdapter() {
             override fun onAnimationEnd(animation: Animator) {
+                applyFrame(1f)
                 onEnd?.invoke()
             }
         })
@@ -243,62 +233,55 @@ fun animateScaleThenResize(
     baseDuration: Long = 300L,
     onEnd: (() -> Unit)? = null
 ) {
-    val scale = try {
-        Settings.Global.getFloat(context.contentResolver, Settings.Global.ANIMATOR_DURATION_SCALE)
-    } catch (e: Settings.SettingNotFoundException) {
-        1.0f
+    val duration = animationDuration(context, baseDuration)
+    val params = view.layoutParams
+
+    fun finish() {
+        params.width = endWidth
+        params.height = endHeight
+        view.layoutParams = params
+        view.scaleX = 1f
+        view.scaleY = 1f
+        onEnd?.invoke()
     }
 
-    val config = try {
-        gson.fromJson(YAMFManagerProxy.configJson, YAMFConfig::class.java)
-    } catch (e: Exception) {
-        gson.fromJson(YAMFManager.configJson, YAMFConfig::class.java)
-    }
-    val adjustedDuration = (if (config.animationSpeed < 5100) config.animationSpeed else 300 * scale).toLong()
+    view.animate().cancel()
+    view.pivotX = view.width * pivotX
+    view.pivotY = view.height * pivotY
+    view.scaleX = startX
+    view.scaleY = startY
 
-    val scaleAnimation = ScaleAnimation(
-        startX, endX,
-        startY, endY,
-        Animation.RELATIVE_TO_SELF, pivotX,
-        Animation.RELATIVE_TO_SELF, pivotY
-    ).apply {
-        duration = adjustedDuration
-        fillAfter = false
-        interpolator = AccelerateDecelerateInterpolator()
-        setAnimationListener(object : Animation.AnimationListener {
-            override fun onAnimationStart(animation: Animation?) {}
-
-            override fun onAnimationEnd(animation: Animation?) {
-                val params = view.layoutParams
-                params.width = endWidth
-                params.height = endHeight
-                view.layoutParams = params
-                onEnd?.invoke()
-            }
-
-            override fun onAnimationRepeat(animation: Animation?) {}
-        })
+    if (duration <= 0L) {
+        finish()
+        return
     }
 
-    view.startAnimation(scaleAnimation)
+    // Property animation stays on the rendering path and avoids rebuilding the
+    // hierarchy during the transition. Resize is committed only once at the end.
+    view.animate()
+        .scaleX(endX)
+        .scaleY(endY)
+        .setDuration(duration)
+        .setInterpolator(DecelerateInterpolator())
+        .withLayer()
+        .withEndAction(::finish)
+        .start()
 }
 
-
 fun animateAlpha(view: View, startAlpha: Float, endAlpha: Float, onEnd: (() -> Unit)? = null) {
-    if (endAlpha == 1F) view.visibility = View.VISIBLE
-    val animation1 = AlphaAnimation(startAlpha, endAlpha)
-    animation1.duration = 300
+    view.animate().cancel()
+    if (endAlpha > 0f) view.visibility = View.VISIBLE
+    view.alpha = startAlpha
 
-    animation1.setAnimationListener(object : Animation.AnimationListener {
-        override fun onAnimationStart(animation: Animation?) {}
-
-        override fun onAnimationEnd(animation: Animation?) {
+    view.animate()
+        .alpha(endAlpha)
+        .setDuration(180L)
+        .setInterpolator(DecelerateInterpolator())
+        .withLayer()
+        .withEndAction {
+            view.alpha = endAlpha
+            view.visibility = if (endAlpha <= 0f) View.GONE else View.VISIBLE
             onEnd?.invoke()
         }
-
-        override fun onAnimationRepeat(animation: Animation?) {}
-    })
-
-    view.startAnimation(animation1)
-    if (endAlpha == 1F) view.visibility = View.VISIBLE else view.visibility = View.GONE
+        .start()
 }
