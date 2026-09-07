@@ -1,5 +1,6 @@
 package com.buildsession.betterYAMF.xposed.hook
 
+import android.app.ITaskStackListenerProxy
 import android.graphics.Rect
 import android.os.Handler
 import android.os.Looper
@@ -31,6 +32,7 @@ object WindowUiFixes {
     private val pendingBounds = ConcurrentHashMap<Int, Rect>()
     private val lastAppliedBounds = ConcurrentHashMap<Int, Rect>()
     private val taskTokens = ConcurrentHashMap<Int, Any>()
+    private val trackedWindows = ConcurrentHashMap.newKeySet<AppWindow>()
     private val boundsFrameScheduled = AtomicBoolean(false)
 
     private val wctClass by lazy {
@@ -42,8 +44,14 @@ object WindowUiFixes {
 
     fun init() {
         hookLegacySurfaceBackendMigration()
+        hookWindowRegistry()
         hookWindowIconNormalization()
         hookSmoothBoundsHotPath()
+
+        // Native-freeform windows all render on display 0, while YAMFManager's legacy registry is
+        // keyed by displayId. Observe task removal independently so multiple smooth windows cannot
+        // overwrite each other's lifecycle tracking.
+        ITaskStackListenerProxy.taskRemovalObserver = ::onTaskRemoved
     }
 
     private fun hookLegacySurfaceBackendMigration() {
@@ -71,6 +79,36 @@ object WindowUiFixes {
                 }
             }
         })
+    }
+
+    private fun hookWindowRegistry() {
+        XposedBridge.hookAllMethods(YAMFManager::class.java, "addWindow", object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                (param.args.getOrNull(1) as? AppWindow)?.let(trackedWindows::add)
+            }
+        })
+        XposedBridge.hookAllMethods(AppWindow::class.java, "onDestroy", object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                trackedWindows.remove(param.thisObject as? AppWindow)
+            }
+        })
+    }
+
+    private fun onTaskRemoved(taskId: Int) {
+        // Binder callbacks are not guaranteed to arrive on the UI thread. AppWindow teardown
+        // touches WindowManager/View state, so always marshal the close onto system_server main.
+        mainHandler.post {
+            taskTokens.remove(taskId)
+            pendingBounds.remove(taskId)
+            lastAppliedBounds.remove(taskId)
+
+            trackedWindows.toList().forEach { window ->
+                if (window.currentTaskId == taskId) {
+                    runCatching { window.onDestroy() }
+                        .onFailure { log(TAG, "Unable to close removed task $taskId", it) }
+                }
+            }
+        }
     }
 
     private fun hookWindowIconNormalization() {
