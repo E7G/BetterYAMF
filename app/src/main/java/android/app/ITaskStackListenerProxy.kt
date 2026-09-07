@@ -1,33 +1,58 @@
 package android.app
 
+import java.lang.reflect.Method
+
 /**
  * Static task-listener adapter for system_server.
  *
- * Do not generate subclasses/dex at runtime here. Android 17's ART/JIT can be extremely sensitive
- * to runtime-generated framework subclasses inside system_server. The hidden framework
- * TaskStackListener already provides a forward-compatible no-op adapter, so subclass it directly.
+ * Android 17/API 37 testing showed an ART/JIT native crash with the previous ByteBuddy generated
+ * Stub subclass. Use the framework TaskStackListener adapter instead: no generated dex, no dynamic
+ * class loading, and the platform owns forward compatibility for newly-added Binder callbacks.
  */
 object ITaskStackListenerProxy {
+    private class CallbackNames {
+        fun onTaskMovedToFront() = Unit
+        fun onTaskDescriptionChanged() = Unit
+        fun onTaskRemovalStarted() = Unit
+        fun onTaskRemoved() = Unit
+    }
+
+    private val movedMethod: Method by lazy {
+        CallbackNames::class.java.getDeclaredMethod("onTaskMovedToFront")
+    }
+    private val descriptionMethod: Method by lazy {
+        CallbackNames::class.java.getDeclaredMethod("onTaskDescriptionChanged")
+    }
+    private val removalStartedMethod: Method by lazy {
+        CallbackNames::class.java.getDeclaredMethod("onTaskRemovalStarted")
+    }
+    private val removedMethod: Method by lazy {
+        CallbackNames::class.java.getDeclaredMethod("onTaskRemoved")
+    }
+
+    @Suppress("UNUSED_PARAMETER")
     fun newInstance(
-        onTaskMovedToFront: (ActivityManager.RunningTaskInfo) -> Unit,
-        onTaskDescriptionChanged: (ActivityManager.RunningTaskInfo) -> Unit,
-        onTaskRemoved: (Int) -> Unit
+        classLoader: ClassLoader,
+        intercept: (Array<Any?>, Method) -> Any?
     ): ITaskStackListener {
         return object : TaskStackListener() {
             override fun onTaskMovedToFront(taskInfo: ActivityManager.RunningTaskInfo) {
-                runCatching { onTaskMovedToFront(taskInfo) }
+                runCatching { intercept(arrayOf(taskInfo), movedMethod) }
             }
 
             override fun onTaskDescriptionChanged(taskInfo: ActivityManager.RunningTaskInfo) {
-                runCatching { onTaskDescriptionChanged(taskInfo) }
+                runCatching { intercept(arrayOf(taskInfo), descriptionMethod) }
             }
 
             override fun onTaskRemovalStarted(taskInfo: ActivityManager.RunningTaskInfo) {
-                runCatching { onTaskRemoved(taskInfo.taskId) }
+                // Preserve the old BetterYAMF callback contract: the manager expects a taskId here.
+                runCatching { intercept(arrayOf(taskInfo.taskId), removalStartedMethod) }
             }
 
             override fun onTaskRemoved(taskId: Int) {
-                runCatching { onTaskRemoved(taskId) }
+                // Some ROMs deliver only onTaskRemoved, normalize it to the same teardown path.
+                runCatching { intercept(arrayOf(taskId), removalStartedMethod) }
+                runCatching { intercept(arrayOf(taskId), removedMethod) }
             }
         }
     }
