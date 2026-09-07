@@ -12,6 +12,20 @@ import java.lang.reflect.Method
 
 object ITaskStackListenerProxy {
     val byteBuddyStrategy = AndroidClassLoadingStrategy.Wrapping(File("/data/system/reYAMF").also { it.mkdirs() })
+
+    private fun normalizeArguments(method: Method, allArguments: Array<Any?>): Array<Any?> {
+        // Android 12+ exposes onTaskRemovalStarted(RunningTaskInfo), while older
+        // code paths (and YAMFManager) consume the legacy taskId form. Some ROMs
+        // still dispatch the legacy signature, so keep this normalization tolerant.
+        if (method.name == "onTaskRemovalStarted") {
+            val taskInfo = allArguments.firstOrNull() as? ActivityManager.RunningTaskInfo
+            if (taskInfo != null) {
+                return arrayOf(taskInfo.taskId)
+            }
+        }
+        return allArguments
+    }
+
     fun newInstance(
         classLoader: ClassLoader,
         intercept: (Array<Any?>, Method) -> Any?
@@ -25,7 +39,7 @@ object ITaskStackListenerProxy {
                     @AllArguments allArguments: Array<Any?>,
                     @Origin method: Method
                 ) {
-                    intercept(allArguments, method)
+                    intercept(normalizeArguments(method, allArguments), method)
                 }
             }))
             .make()
