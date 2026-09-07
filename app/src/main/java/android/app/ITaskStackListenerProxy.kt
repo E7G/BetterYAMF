@@ -1,70 +1,34 @@
 package android.app
 
-import net.bytebuddy.ByteBuddy
-import net.bytebuddy.android.AndroidClassLoadingStrategy
-import net.bytebuddy.implementation.MethodDelegation
-import net.bytebuddy.implementation.bind.annotation.AllArguments
-import net.bytebuddy.implementation.bind.annotation.Origin
-import net.bytebuddy.implementation.bind.annotation.RuntimeType
-import net.bytebuddy.matcher.ElementMatchers
-import java.io.File
-import java.lang.reflect.Method
-
+/**
+ * Static task-listener adapter for system_server.
+ *
+ * Do not generate subclasses/dex at runtime here. Android 17's ART/JIT can be extremely sensitive
+ * to runtime-generated framework subclasses inside system_server. The hidden framework
+ * TaskStackListener already provides a forward-compatible no-op adapter, so subclass it directly.
+ */
 object ITaskStackListenerProxy {
-    val byteBuddyStrategy = AndroidClassLoadingStrategy.Wrapping(File("/data/system/reYAMF").also { it.mkdirs() })
-
-    /**
-     * Optional observer used by BetterYAMF's own window registry. The platform task listener is
-     * shared by legacy virtual-display windows and native-freeform windows, so observing removals
-     * here avoids relying on displayId as a window identity (native freeform always uses display 0).
-     */
-    @Volatile
-    var taskRemovalObserver: ((Int) -> Unit)? = null
-
-    private fun normalizeArguments(method: Method, allArguments: Array<Any?>): Array<Any?> {
-        if (method.name == "onTaskRemovalStarted" || method.name == "onTaskRemoved") {
-            val first = allArguments.firstOrNull()
-            val taskId = when (first) {
-                is ActivityManager.RunningTaskInfo -> first.taskId
-                is Number -> first.toInt()
-                else -> null
+    fun newInstance(
+        onTaskMovedToFront: (ActivityManager.RunningTaskInfo) -> Unit,
+        onTaskDescriptionChanged: (ActivityManager.RunningTaskInfo) -> Unit,
+        onTaskRemoved: (Int) -> Unit
+    ): ITaskStackListener {
+        return object : TaskStackListener() {
+            override fun onTaskMovedToFront(taskInfo: ActivityManager.RunningTaskInfo) {
+                runCatching { onTaskMovedToFront(taskInfo) }
             }
 
-            if (taskId != null) {
-                // Never let an optional observer break the system Binder callback.
-                runCatching { taskRemovalObserver?.invoke(taskId) }
+            override fun onTaskDescriptionChanged(taskInfo: ActivityManager.RunningTaskInfo) {
+                runCatching { onTaskDescriptionChanged(taskInfo) }
             }
 
-            // Android 12+ exposes onTaskRemovalStarted(RunningTaskInfo), while the existing
-            // YAMFManager callback consumes the legacy taskId form. Normalize only that callback;
-            // onTaskRemoved already carries an int and is left untouched for ROM compatibility.
-            if (method.name == "onTaskRemovalStarted" && first is ActivityManager.RunningTaskInfo) {
-                return arrayOf(first.taskId)
+            override fun onTaskRemovalStarted(taskInfo: ActivityManager.RunningTaskInfo) {
+                runCatching { onTaskRemoved(taskInfo.taskId) }
+            }
+
+            override fun onTaskRemoved(taskId: Int) {
+                runCatching { onTaskRemoved(taskId) }
             }
         }
-        return allArguments
-    }
-
-    fun newInstance(
-        classLoader: ClassLoader,
-        intercept: (Array<Any?>, Method) -> Any?
-    ): ITaskStackListener {
-        return ByteBuddy()
-            .subclass(ITaskStackListener.Stub::class.java)
-            .method(ElementMatchers.any())
-            .intercept(MethodDelegation.to(object {
-                @RuntimeType
-                fun intercept(
-                    @AllArguments allArguments: Array<Any?>,
-                    @Origin method: Method
-                ) {
-                    intercept(normalizeArguments(method, allArguments), method)
-                }
-            }))
-            .make()
-            .load(classLoader, byteBuddyStrategy)
-            .loaded
-            .getDeclaredConstructor()
-            .newInstance()
     }
 }
