@@ -63,7 +63,7 @@ jobs:
               });
               const headers = {};
               for (const [k, v] of upstream.headers.entries()) {
-                if (!['connection', 'transfer-encoding', 'content-encoding'].includes(k.toLowerCase())) {
+                if (!['connection', 'transfer-encoding', 'content-encoding', 'content-length'].includes(k.toLowerCase())) {
                   headers[k] = v;
                 }
               }
