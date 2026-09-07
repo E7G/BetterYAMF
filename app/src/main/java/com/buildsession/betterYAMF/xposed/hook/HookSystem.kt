@@ -42,6 +42,11 @@ class HookSystem : IXposedHookZygoteInit, IXposedHookLoadPackage {
         }.onFailure {
             log(TAG, "FreeformHook init failed, but continuing for legacy support", it)
         }
+        runCatching {
+            WindowUiFixes.init()
+        }.onFailure {
+            log(TAG, "WindowUiFixes init failed, continuing without optional UI fixes", it)
+        }
 
          var serviceManagerHook: XC_MethodHook.Unhook? = null
          serviceManagerHook = findMethod("android.os.ServiceManager") {
