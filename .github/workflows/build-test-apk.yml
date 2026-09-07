@@ -28,53 +28,109 @@ jobs:
         with:
           gradle-version: '8.11.1'
 
-      - name: Configure Gradle proxy
+      - name: Start local Maven bridge
         shell: bash
         run: |
-          python3 - <<'PY'
-          import os
-          from urllib.parse import urlparse
-          proxy = os.environ.get('HTTPS_PROXY') or os.environ.get('https_proxy') or os.environ.get('HTTP_PROXY') or os.environ.get('http_proxy')
-          if not proxy:
-              print('No proxy environment found; continuing without JVM proxy settings')
-              raise SystemExit(0)
-          p = urlparse(proxy)
-          host = p.hostname
-          port = p.port or (443 if p.scheme == 'https' else 80)
-          gradle_dir = os.path.expanduser('~/.gradle')
-          os.makedirs(gradle_dir, exist_ok=True)
-          props = os.path.join(gradle_dir, 'gradle.properties')
-          lines = [
-              f'systemProp.http.proxyHost={host}',
-              f'systemProp.http.proxyPort={port}',
-              f'systemProp.https.proxyHost={host}',
-              f'systemProp.https.proxyPort={port}',
-          ]
-          if p.username:
-              lines += [
-                  f'systemProp.http.proxyUser={p.username}',
-                  f'systemProp.https.proxyUser={p.username}',
-              ]
-          if p.password:
-              lines += [
-                  f'systemProp.http.proxyPassword={p.password}',
-                  f'systemProp.https.proxyPassword={p.password}',
-              ]
-          with open(props, 'a', encoding='utf-8') as f:
-              f.write('\n' + '\n'.join(lines) + '\n')
-          print(f'Configured JVM proxy host {host}:{port}')
-          PY
+          cat > /tmp/maven-bridge.js <<'JS'
+          const http = require('http');
+          const { Readable } = require('stream');
+
+          const routes = {
+            google: 'https://dl.google.com/dl/android/maven2/',
+            central: 'https://repo.maven.apache.org/maven2/',
+            plugins: 'https://plugins.gradle.org/m2/',
+            jitpack: 'https://jitpack.io/',
+            xposed: 'https://api.xposed.info/',
+            mvnrepo: 'https://mvnrepository.com/artifact/'
+          };
+
+          const server = http.createServer(async (req, res) => {
+            try {
+              const parsed = new URL(req.url, 'http://127.0.0.1');
+              const parts = parsed.pathname.split('/').filter(Boolean);
+              const key = parts.shift();
+              const base = routes[key];
+              if (!base) {
+                res.writeHead(404);
+                return res.end('unknown repository');
+              }
+              const target = base + parts.join('/') + parsed.search;
+              console.log(`${req.method} ${target}`);
+              const upstream = await fetch(target, {
+                method: req.method === 'HEAD' ? 'HEAD' : 'GET',
+                redirect: 'follow',
+                headers: { 'user-agent': 'BetterYAMF-CI-MavenBridge/1.0' }
+              });
+              const headers = {};
+              for (const [k, v] of upstream.headers.entries()) {
+                if (!['connection', 'transfer-encoding', 'content-encoding'].includes(k.toLowerCase())) {
+                  headers[k] = v;
+                }
+              }
+              res.writeHead(upstream.status, headers);
+              if (req.method === 'HEAD' || !upstream.body) return res.end();
+              Readable.fromWeb(upstream.body).pipe(res);
+            } catch (e) {
+              console.error(e);
+              if (!res.headersSent) res.writeHead(502);
+              res.end(String(e));
+            }
+          });
+
+          server.listen(39000, '127.0.0.1', () => console.log('Maven bridge listening on 39000'));
+          JS
+
+          node -e "fetch('https://dl.google.com/dl/android/maven2/com/android/tools/build/gradle/8.9.3/gradle-8.9.3.pom').then(r=>{console.log('Node Google Maven probe:',r.status); if(!r.ok) process.exit(2)}).catch(e=>{console.error(e); process.exit(3)})"
+          nohup node /tmp/maven-bridge.js >/tmp/maven-bridge.log 2>&1 &
+          echo $! >/tmp/maven-bridge.pid
+          sleep 1
+          cat /tmp/maven-bridge.log
+
+      - name: Route Gradle repositories through local bridge
+        shell: bash
+        run: |
+          cp settings.gradle.kts /tmp/settings.gradle.kts.original
+          cat > settings.gradle.kts <<'EOF'
+          @file:Suppress("UnstableApiUsage")
+
+          pluginManagement {
+              repositories {
+                  maven("http://127.0.0.1:39000/google") { isAllowInsecureProtocol = true }
+                  maven("http://127.0.0.1:39000/central") { isAllowInsecureProtocol = true }
+                  maven("http://127.0.0.1:39000/plugins") { isAllowInsecureProtocol = true }
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  maven("http://127.0.0.1:39000/google") { isAllowInsecureProtocol = true }
+                  maven("http://127.0.0.1:39000/central") { isAllowInsecureProtocol = true }
+                  maven("http://127.0.0.1:39000/jitpack") { isAllowInsecureProtocol = true }
+                  maven("http://127.0.0.1:39000/xposed") { isAllowInsecureProtocol = true }
+                  maven("http://127.0.0.1:39000/mvnrepo") { isAllowInsecureProtocol = true }
+              }
+          }
+
+          rootProject.name = "BetterYAMF"
+          include(":app", ":android-stub")
+          EOF
 
       - name: Build debug APK
         run: gradle :app:assembleDebug --stacktrace --no-daemon
 
+      - name: Show Maven bridge log on failure
+        if: failure()
+        run: tail -n 200 /tmp/maven-bridge.log || true
+
       - name: Collect APK
+        if: success()
         run: |
           mkdir -p out
           cp app/build/outputs/apk/debug/*.apk out/BetterYAMF-native-window-ux-debug.apk
           sha256sum out/*.apk | tee out/SHA256SUMS.txt
 
       - name: Upload APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: BetterYAMF-native-window-ux-debug
