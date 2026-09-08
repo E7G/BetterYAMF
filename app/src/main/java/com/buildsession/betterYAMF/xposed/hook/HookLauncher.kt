@@ -19,6 +19,7 @@ import android.graphics.drawable.ShapeDrawable
 import android.graphics.drawable.shapes.RoundRectShape
 import android.graphics.drawable.Icon
 import android.os.Handler
+import android.os.Build
 import android.os.Looper
 import android.os.UserHandle
 import android.view.Gravity
@@ -28,7 +29,6 @@ import android.view.WindowManager
 import android.view.ViewGroup
 import android.widget.ImageView
 import android.widget.TextView
-import android.widget.Toast
 import androidx.core.graphics.drawable.toBitmap
 import com.github.kyuubiran.ezxhelper.init.EzXHelperInit
 import com.github.kyuubiran.ezxhelper.init.InitFields.moduleRes
@@ -85,8 +85,11 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
     private val mMainHandler: Handler by lazy { Handler(Looper.getMainLooper()) }
     private var mScreenHeight = 0
     private var mScreenWidth = 0
+    private var mStartX = 0f
     private var mStartY = 0f
     private var mIsShowingZone = false
+    private var mIsYamfGesture = false
+    private var mSyntheticCancelEvent: MotionEvent? = null
     private var mCurrentTaskId = -1
 
     private var mCurrentRotation = 0
@@ -117,8 +120,8 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
             mScreenHeight = newHeight
             
             // 横屏下让释放区更宽一些，竖屏下保持原
-            val zoneWidthPercent = if (mScreenWidth > mScreenHeight) 0.5 else 0.6
-            val zoneHeightPercent = if (mScreenWidth > mScreenHeight) 0.4 else 0.3
+            val zoneWidthPercent = if (mScreenWidth > mScreenHeight) 0.36 else 0.42
+            val zoneHeightPercent = if (mScreenWidth > mScreenHeight) 0.48 else 0.34
             
             val zoneWidth = (mScreenWidth * zoneWidthPercent).toInt()
             val zoneHeight = (mScreenHeight * zoneHeightPercent).toInt()
@@ -172,7 +175,7 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                             mDropZoneView = TextView(context).apply {
                                 visibility = View.GONE
                                 gravity = Gravity.CENTER
-                                text = "Drag here to open in window"
+                                text = "小窗"
                                 setTextColor(Color.WHITE)
                                 textSize = 16f
                                 setPadding(20, 20, 20, 20)
@@ -209,22 +212,21 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     val event = param.args[0] as? MotionEvent ?: return
                     val action = event.actionMasked
-                    if (action != MotionEvent.ACTION_DOWN && 
-                        action != MotionEvent.ACTION_MOVE && 
+                    if (action != MotionEvent.ACTION_DOWN &&
+                        action != MotionEvent.ACTION_MOVE &&
                         action != MotionEvent.ACTION_UP &&
-                        action != MotionEvent.ACTION_CANCEL) return
+                        action != MotionEvent.ACTION_CANCEL
+                    ) return
 
                     val context = AndroidAppHelper.currentApplication()
-                    
-                    // 仅在 DOWN 时更新屏幕信息，减少开销
                     if (action == MotionEvent.ACTION_DOWN) {
                         updateDimensions(context)
                         val wm = context.getSystemService(android.content.Context.WINDOW_SERVICE) as WindowManager
                         mCurrentRotation = wm.defaultDisplay.rotation
                         val rawX = event.rawX
                         val rawY = event.rawY
-                        
-                        mIsAlreadyVisual = if (mCurrentRotation == 0) {
+                        // Newer Quickstep dispatches logical display coordinates in every rotation.
+                        mIsAlreadyVisual = Build.VERSION.SDK_INT >= 35 || if (mCurrentRotation == 0) {
                             true
                         } else if (mScreenWidth > mScreenHeight) {
                             rawX > mScreenHeight + 100 || rawY > mScreenHeight + 100
@@ -237,120 +239,120 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                     val rawY = event.rawY
                     val correctedX: Float
                     val correctedY: Float
-
                     if (mIsAlreadyVisual) {
                         correctedX = rawX
                         correctedY = rawY
+                    } else if (mCurrentRotation == 1) {
+                        correctedX = rawY
+                        correctedY = mScreenHeight.toFloat() - rawX
+                    } else if (mCurrentRotation == 3) {
+                        correctedX = mScreenWidth.toFloat() - rawY
+                        correctedY = rawX
                     } else {
-                        if (mCurrentRotation == 1) { // ROTATION_90 (Landscape CCW)
-                            correctedX = rawY
-                            correctedY = mScreenHeight.toFloat() - rawX
-                        } else if (mCurrentRotation == 3) { // ROTATION_270 (Landscape CW)
-                            correctedX = mScreenWidth.toFloat() - rawY
-                            correctedY = rawX
-                        } else {
-                            correctedX = rawX
-                            correctedY = rawY
-                        }
+                        correctedX = rawX
+                        correctedY = rawY
                     }
 
+                    val isLandscape = mScreenWidth > mScreenHeight
                     val isInZone = mDropZoneRect.contains(correctedX.toInt(), correctedY.toInt())
 
                     when (action) {
                         MotionEvent.ACTION_DOWN -> {
+                            mStartX = correctedX
                             mStartY = correctedY
                             mIsShowingZone = false
+                            mIsYamfGesture = false
                             mCurrentTaskId = runCatching { captureTopTask(context) }.getOrDefault(-1)
-                            // 只有从底部 5% 区域开始的滑动才被认为是潜在的上划手势
-                            mIsPotentialSwipeUp = correctedY > mScreenHeight * 0.95
-                            // log(TAG, "ACTION_DOWN at ($correctedX, $correctedY), potential=$mIsPotentialSwipeUp")
+                            val bottomEdgeRatio = if (isLandscape) 0.90f else 0.94f
+                            mIsPotentialSwipeUp = correctedY > mScreenHeight * bottomEdgeRatio
                         }
 
                         MotionEvent.ACTION_MOVE -> {
                             if (!mIsPotentialSwipeUp) return
-                            
-                            val diffY = mStartY - correctedY
-                            val threshold = mScreenHeight * 0.2
-                            
-                            if (diffY > threshold) {
-                                if (!mIsShowingZone) {
-                                    // 仅在达到阈值时才进行反射调用，大幅减少性能损耗
-                                    var capturedTaskId = mCurrentTaskId
-                                    if (capturedTaskId == -1) runCatching {
-                                        val gestureState = XposedHelpers.getObjectField(param.thisObject, "mGestureState")
-                                        if (gestureState != null) {
-                                            val taskId = XposedHelpers.callMethod(gestureState, "getTopRunningTaskId") as Int
-                                            val runningTask = XposedHelpers.callMethod(gestureState, "getRunningTask")
-                                            val isHomeTask = if (runningTask != null) {
-                                                XposedHelpers.callMethod(runningTask, "isHomeTask") as Boolean
-                                            } else false
-                                            
-                                            // ActivityClientRecord internals changed on newer Android.
-                                            // GestureState already identifies a non-home task reliably.
-                                            if (taskId != -1 && !isHomeTask) capturedTaskId = taskId
-                                        }
-                                    }
 
-                                    if (capturedTaskId != -1) {
-                                        mCurrentTaskId = capturedTaskId
-                                        mIsShowingZone = true
-                                        mMainHandler.post {
-                                            mDropZoneView?.visibility = View.VISIBLE
-                                        }
-                                        // log(TAG, "Swipe up threshold reached with taskId $mCurrentTaskId")
-                                    } else {
-                                        // 如果不是有效的任务（例如在桌面），则不再处理后续 MOVE
-                                        mIsPotentialSwipeUp = false
-                                    }
-                                }
-                            } else {
-                                if (mIsShowingZone) {
-                                    mIsShowingZone = false
-                                    mMainHandler.post {
-                                        mDropZoneView?.visibility = View.GONE
-                                    }
-                                }
-                            }
-                            
-                            if (mIsShowingZone) {
+                            if (mIsYamfGesture) {
                                 updateDropZoneColor(isInZone)
+                                param.result = null
+                                return
                             }
+
+                            val diffX = correctedX - mStartX
+                            val diffY = mStartY - correctedY
+                            val minX = mScreenWidth * if (isLandscape) 0.12f else 0.14f
+                            val minY = mScreenHeight * if (isLandscape) 0.16f else 0.15f
+                            val rightIntentX = mScreenWidth * if (isLandscape) 0.68f else 0.62f
+                            val isDiagonalToUpperRight = diffX > minX && diffY > minY &&
+                                    correctedX > rightIntentX
+                            if (!isDiagonalToUpperRight) return
+
+                            var capturedTaskId = mCurrentTaskId
+                            if (capturedTaskId == -1) runCatching {
+                                val gestureState = XposedHelpers.getObjectField(param.thisObject, "mGestureState")
+                                if (gestureState != null) {
+                                    val taskId = XposedHelpers.callMethod(gestureState, "getTopRunningTaskId") as Int
+                                    val runningTask = XposedHelpers.callMethod(gestureState, "getRunningTask")
+                                    val isHomeTask = runningTask != null &&
+                                            XposedHelpers.callMethod(runningTask, "isHomeTask") as Boolean
+                                    if (taskId != -1 && !isHomeTask) capturedTaskId = taskId
+                                }
+                            }
+                            if (capturedTaskId == -1) {
+                                mIsPotentialSwipeUp = false
+                                return
+                            }
+
+                            mCurrentTaskId = capturedTaskId
+                            mIsYamfGesture = true
+                            mIsShowingZone = true
+                            mMainHandler.post { mDropZoneView?.visibility = View.VISIBLE }
+                            updateDropZoneColor(isInZone)
+
+                            // Cancel Quickstep's in-progress overview gesture exactly once.
+                            // Later events are consumed, so overview and YAMF never both finish.
+                            mSyntheticCancelEvent = MotionEvent.obtain(event).also {
+                                it.setAction(MotionEvent.ACTION_CANCEL)
+                            }
+                            param.args[0] = mSyntheticCancelEvent
                         }
 
                         MotionEvent.ACTION_UP -> {
-                                // log(TAG, "ACTION_UP at ($correctedX, $correctedY), isInZone=$isInZone, isShowing=$mIsShowingZone, taskId=$mCurrentTaskId")
-                                if (mIsShowingZone && isInZone && mCurrentTaskId != -1) {
-                                    val intent = Intent(YAMFManager.ACTION_OPEN_IN_YAMF).apply {
+                            val consume = mIsYamfGesture
+                            if (consume && isInZone && mCurrentTaskId != -1) {
+                                AndroidAppHelper.currentApplication().sendBroadcast(
+                                    Intent(YAMFManager.ACTION_OPEN_IN_YAMF).apply {
                                         setPackage("android")
                                         putExtra(YAMFManager.EXTRA_TASK_ID, mCurrentTaskId)
                                         putExtra(YAMFManager.EXTRA_SOURCE, YAMFManager.SOURCE_RECENT)
                                     }
-                                    AndroidAppHelper.currentApplication().sendBroadcast(intent)
-                                    // log(TAG, "Sent broadcast to open task $mCurrentTaskId in YAMF")
-                                    
-                                    mMainHandler.post {
-                                        Toast.makeText(
-                                            mDropZoneView?.context ?: AndroidAppHelper.currentApplication(),
-                                            "Task $mCurrentTaskId windowed!",
-                                            Toast.LENGTH_SHORT
-                                        ).show()
-                                    }
-                                }
-                                mMainHandler.post {
-                                    mDropZoneView?.visibility = View.GONE
-                                }
-                                mIsShowingZone = false
-                                mCurrentTaskId = -1
+                                )
                             }
-
-                            MotionEvent.ACTION_CANCEL -> {
-                                // log(TAG, "ACTION_CANCEL")
-                                mMainHandler.post {
-                                    mDropZoneView?.visibility = View.GONE
-                                }
-                                mIsShowingZone = false
-                            }
+                            mMainHandler.post { mDropZoneView?.visibility = View.GONE }
+                            mIsShowingZone = false
+                            mIsYamfGesture = false
+                            mIsPotentialSwipeUp = false
+                            mCurrentTaskId = -1
+                            if (consume) param.result = null
                         }
+
+                        MotionEvent.ACTION_CANCEL -> {
+                            val consume = mIsYamfGesture
+                            mMainHandler.post { mDropZoneView?.visibility = View.GONE }
+                            mIsShowingZone = false
+                            mIsYamfGesture = false
+                            mIsPotentialSwipeUp = false
+                            mCurrentTaskId = -1
+                            if (consume) param.result = null
+                        }
+                    }
+                }
+
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    mSyntheticCancelEvent?.let { cancelEvent ->
+                        if (param.args[0] === cancelEvent) {
+                            cancelEvent.recycle()
+                            mSyntheticCancelEvent = null
+                        }
+                    }
                 }
             })
 
