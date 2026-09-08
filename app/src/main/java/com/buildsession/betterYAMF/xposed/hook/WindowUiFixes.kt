@@ -1,10 +1,7 @@
 package com.buildsession.betterYAMF.xposed.hook
 
-import android.widget.ImageView
 import com.buildsession.betterYAMF.common.gson
 import com.buildsession.betterYAMF.xposed.services.YAMFManager
-import com.buildsession.betterYAMF.xposed.ui.window.AppWindow
-import com.buildsession.betterYAMF.xposed.utils.dpToPx
 import com.buildsession.betterYAMF.xposed.utils.log
 import com.google.gson.JsonParser
 import de.robv.android.xposed.XC_MethodHook
@@ -20,7 +17,6 @@ object WindowUiFixes {
 
     fun init() {
         hookLegacySurfaceBackendMigration()
-        hookWindowIconNormalization()
     }
 
     private fun hookLegacySurfaceBackendMigration() {
@@ -48,29 +44,4 @@ object WindowUiFixes {
         })
     }
 
-    private fun hookWindowIconNormalization() {
-        val normalizeAfter = object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                normalizeWindowIcon(param.thisObject as? AppWindow ?: return)
-            }
-        }
-
-        XposedBridge.hookAllMethods(AppWindow::class.java, "updateTask", normalizeAfter)
-        XposedBridge.hookAllMethods(AppWindow::class.java, "onTaskDescriptionChanged", normalizeAfter)
-    }
-
-    private fun normalizeWindowIcon(window: AppWindow) {
-        runCatching {
-            val icon = window.binding.appIcon
-            val inset = 3.dpToPx().toInt()
-            icon.scaleType = ImageView.ScaleType.FIT_CENTER
-            if (icon.paddingLeft != inset || icon.paddingTop != inset ||
-                icon.paddingRight != inset || icon.paddingBottom != inset
-            ) {
-                icon.setPadding(inset, inset, inset, inset)
-            }
-        }.onFailure {
-            log(TAG, "Unable to normalize collapsed app icon", it)
-        }
-    }
 }

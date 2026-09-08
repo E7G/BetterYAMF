@@ -2,6 +2,7 @@ package com.buildsession.betterYAMF.xposed.hook
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.ActivityManager
 import android.app.AndroidAppHelper
 import android.app.PendingIntent
 import android.app.RemoteAction
@@ -91,6 +92,16 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
     private var mCurrentRotation = 0
     private var mIsAlreadyVisual = true
     private var mIsPotentialSwipeUp = false
+
+    @Suppress("DEPRECATION")
+    private fun captureTopTask(context: android.content.Context): Int {
+        val activityManager = context.getSystemService(android.content.Context.ACTIVITY_SERVICE) as ActivityManager
+        return activityManager.getRunningTasks(10)
+            .firstOrNull { task ->
+                task.taskId > 0 && task.baseActivity?.packageName != context.packageName
+            }
+            ?.taskId ?: -1
+    }
 
     private fun updateDimensions(context: android.content.Context) {
         val wm = context.getSystemService(android.content.Context.WINDOW_SERVICE) as WindowManager
@@ -192,7 +203,9 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
             }
 
             // 使用更通用的方式 Hook onInputEvent
-            XposedBridge.hookAllMethods(tisClass, "onInputEvent", object : XC_MethodHook() {
+            // Android 17 moved input dispatch out of TouchInteractionService.
+            val inputOwnerClass = loadClassOrNull("com.android.quickstep.TouchInteractionHandler") ?: tisClass
+            XposedBridge.hookAllMethods(inputOwnerClass, "onInputEvent", object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     val event = param.args[0] as? MotionEvent ?: return
                     val action = event.actionMasked
@@ -201,7 +214,7 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         action != MotionEvent.ACTION_UP &&
                         action != MotionEvent.ACTION_CANCEL) return
 
-                    val context = param.thisObject as android.app.Service
+                    val context = AndroidAppHelper.currentApplication()
                     
                     // 仅在 DOWN 时更新屏幕信息，减少开销
                     if (action == MotionEvent.ACTION_DOWN) {
@@ -247,7 +260,7 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         MotionEvent.ACTION_DOWN -> {
                             mStartY = correctedY
                             mIsShowingZone = false
-                            mCurrentTaskId = -1
+                            mCurrentTaskId = runCatching { captureTopTask(context) }.getOrDefault(-1)
                             // 只有从底部 5% 区域开始的滑动才被认为是潜在的上划手势
                             mIsPotentialSwipeUp = correctedY > mScreenHeight * 0.95
                             // log(TAG, "ACTION_DOWN at ($correctedX, $correctedY), potential=$mIsPotentialSwipeUp")
@@ -262,8 +275,8 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                             if (diffY > threshold) {
                                 if (!mIsShowingZone) {
                                     // 仅在达到阈值时才进行反射调用，大幅减少性能损耗
-                                    var capturedTaskId = -1
-                                    runCatching {
+                                    var capturedTaskId = mCurrentTaskId
+                                    if (capturedTaskId == -1) runCatching {
                                         val gestureState = XposedHelpers.getObjectField(param.thisObject, "mGestureState")
                                         if (gestureState != null) {
                                             val taskId = XposedHelpers.callMethod(gestureState, "getTopRunningTaskId") as Int
@@ -272,28 +285,9 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                                                 XposedHelpers.callMethod(runningTask, "isHomeTask") as Boolean
                                             } else false
                                             
-                                            if (taskId != -1 && !isHomeTask) {
-                                                // 增强校验：不仅要 Launcher 获得焦点，还要确保 Launcher 的 Activity 处于 Resumed 状态
-                                                // 这能有效排除沉浸模式下仅划出导航栏的情况
-                                                val isLauncherActive = runCatching {
-                                                    val activityThread = XposedHelpers.callStaticMethod(
-                                                        Class.forName("android.app.ActivityThread"),
-                                                        "currentActivityThread"
-                                                    )
-                                                    val mActivities = XposedHelpers.getObjectField(activityThread, "mActivities") as Map<*, *>
-                                                    
-                                                    // 检查当前进程中是否有任何 Activity 是处于 Resumed 状态的
-                                                    mActivities.values.any { activityRecord ->
-                                                        val paused = XposedHelpers.getBooleanField(activityRecord, "paused")
-                                                        val activity = XposedHelpers.getObjectField(activityRecord, "activity") as? Activity
-                                                        activity != null && !activity.isFinishing && !paused
-                                                    }
-                                                }.getOrDefault(false)
-
-                                                if (isLauncherActive) {
-                                                    capturedTaskId = taskId
-                                                }
-                                            }
+                                            // ActivityClientRecord internals changed on newer Android.
+                                            // GestureState already identifies a non-home task reliably.
+                                            if (taskId != -1 && !isHomeTask) capturedTaskId = taskId
                                         }
                                     }
 
@@ -538,7 +532,7 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
     private fun hookPopup(lpparam: XC_LoadPackage.LoadPackageParam) {
         // log(TAG, "hooking popup ${lpparam.packageName}")
         loadClass("com.android.launcher3.popup.ArrowPopup").apply {
-            findMethod { name == "onVisibilityAggregated" }.hookAfter {
+            findMethodOrNull { name == "onVisibilityAggregated" }?.hookAfter {
                 if (it.args[0] as Boolean) {
                     val popup = it.thisObject as View
                     val container = popup.parent as ViewGroup

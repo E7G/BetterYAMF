@@ -133,7 +133,7 @@ class HookSystem : IXposedHookZygoteInit, IXposedHookLoadPackage {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val thisObject = param.thisObject
                         val displayId = XposedHelpers.getIntField(thisObject, "mDisplayId")
-                        YAMFManager.currentDisplayId = displayId
+                        YAMFManager.onFocusedDisplayChanged(displayId)
                     }
                 }
             )
