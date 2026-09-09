@@ -152,14 +152,6 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
 
     fun setCommit(commit: Boolean) { session?.commit = commit }
 
-    fun isFullyInside(zone: Rect): Boolean {
-        val s = session ?: return false
-        return s.claimed && zone.contains(
-            s.rect.left.toInt(), s.rect.top.toInt(),
-            s.rect.right.toInt(), s.rect.bottom.toInt()
-        )
-    }
-
     fun abort() { session?.let(::restoreSystemGesture) }
 
     private fun scheduleApply(s: Session) {

@@ -116,6 +116,11 @@ class AppWindow(
     private val mainScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     private val rotationWatcher = RotationWatcher()
+    private val screenRotationWatcher = object : IRotationWatcher.Stub() {
+        override fun onRotationChanged(rotation: Int) {
+            runMain { keepInScreenAfterRotation(rotation) }
+        }
+    }
     private val surfaceOnTouchListener = SurfaceOnTouchListener()
     private val surfaceOnGenericMotionListener = SurfaceOnGenericMotionListener()
     var displayId = -1
@@ -326,6 +331,11 @@ class AppWindow(
 
         binding.root.let { layout ->
             Instances.windowManager.addView(layout, params)
+        }
+        runCatching {
+            Instances.iWindowManager.watchRotation(screenRotationWatcher, Display.DEFAULT_DISPLAY)
+        }.onFailure { error ->
+            Log.w(TAG, "Unable to watch main display rotation", error)
         }
 
         binding.rootClickMask.setOnTouchListener { _, event ->
@@ -785,6 +795,7 @@ class AppWindow(
 
         runCatching { context.unregisterReceiver(broadcastReceiver) }
         runCatching { Instances.iWindowManager.removeRotationWatcher(rotationWatcher) }
+        runCatching { Instances.iWindowManager.removeRotationWatcher(screenRotationWatcher) }
         
         YAMFManager.removeWindow(displayId)
         if (config.windowMode == 0) {
@@ -983,8 +994,9 @@ class AppWindow(
                 binding.rlBarControllerBottom.isVisible = false
             }
             
-            // After rotation, make sure the window is still in screen
-            keepInScreen(animate = false)
+            // Rotation callback can precede new display metrics and WRAP_CONTENT layout.
+            // Re-clamp over several frames with bounds corrected for this rotation.
+            keepInScreenAfterRotation(rotation)
         }
     }
 
@@ -1063,12 +1075,35 @@ class AppWindow(
         }
     }
 
-    private fun keepInScreen(animate: Boolean = true) {
+    private fun getScreenSize(expectedRotation: Int? = null): Pair<Int, Int> {
+        val metrics = getRealScreenMetrics()
+        var width = metrics.widthPixels
+        var height = metrics.heightPixels
+        if (expectedRotation != null) {
+            val expectedLandscape = expectedRotation == Surface.ROTATION_90 ||
+                    expectedRotation == Surface.ROTATION_270
+            if (expectedLandscape != (width > height)) {
+                val oldWidth = width
+                width = height
+                height = oldWidth
+            }
+        }
+        return width to height
+    }
+
+    private fun keepInScreenAfterRotation(rotation: Int, pass: Int = 0) {
+        binding.root.postOnAnimation {
+            keepInScreen(animate = false, expectedRotation = rotation)
+            if (pass < 2) {
+                binding.root.postDelayed({ keepInScreenAfterRotation(rotation, pass + 1) }, 32L)
+            }
+        }
+    }
+
+    private fun keepInScreen(animate: Boolean = true, expectedRotation: Int? = null) {
         binding.root.post {
             val params = binding.root.layoutParams as WindowManager.LayoutParams
-            val displayMetrics = getRealScreenMetrics()
-            val screenWidth = displayMetrics.widthPixels
-            val screenHeight = displayMetrics.heightPixels
+            val (screenWidth, screenHeight) = getScreenSize(expectedRotation)
 
             val windowWidth = binding.root.width
             val windowHeight = binding.root.height

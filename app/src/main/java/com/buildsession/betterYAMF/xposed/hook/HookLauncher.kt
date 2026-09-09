@@ -133,8 +133,9 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
             mScreenHeight = newHeight
             
             // 横屏下让释放区更宽一些，竖屏下保持原
-            val zoneWidthPercent = if (mScreenWidth > mScreenHeight) 0.34 else 0.47
-            val zoneHeightPercent = if (mScreenWidth > mScreenHeight) 0.68 else 0.46
+            // Keep the compact, top-right hot area used by the original project.
+            val zoneWidthPercent = if (mScreenWidth > mScreenHeight) 0.50 else 0.60
+            val zoneHeightPercent = if (mScreenWidth > mScreenHeight) 0.40 else 0.30
             
             val zoneWidth = (mScreenWidth * zoneWidthPercent).toInt()
             val zoneHeight = (mScreenHeight * zoneHeightPercent).toInt()
@@ -219,10 +220,12 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                             val progress = (upward / (mScreenHeight * .60f)).coerceIn(0f, 1f)
                             if (progress >= .10f) showDropZone(context)
                             nativeTransition.update(progress, correctedX - mStartX)
-                            updateDropZone(nativeTransition.isFullyInside(mDropZoneRect))
+                            updateDropZone(nativeTransition.claimed && mDropZoneRect.contains(
+                                correctedX.toInt(), correctedY.toInt()))
                         }
                         MotionEvent.ACTION_UP -> if (mIsPotentialSwipeUp) {
-                            nativeTransition.setCommit(nativeTransition.isFullyInside(mDropZoneRect))
+                            nativeTransition.setCommit(nativeTransition.claimed && mDropZoneRect.contains(
+                                correctedX.toInt(), correctedY.toInt()))
                             hideDropZone()
                             resetGestureTracking(false)
                         }
