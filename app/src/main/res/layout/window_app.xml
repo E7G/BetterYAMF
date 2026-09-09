@@ -83,12 +83,11 @@
         android:layout_height="wrap_content"
         android:background="@null"
         android:backgroundTint="@android:color/transparent"
-        android:elevation="8dp"
-        android:paddingBottom="15dp"
+        android:elevation="16dp"
         android:visibility="invisible"
         android:clipChildren="false"
         android:clipToPadding="false"
-        app:cardBackgroundColor="?attr/colorSurface"
+        app:cardBackgroundColor="@android:color/transparent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toTopOf="parent"
         app:strokeColor="@color/transparentOutline"
@@ -96,19 +95,22 @@
 
         <com.google.android.material.card.MaterialCardView
             android:id="@+id/cvapp_icon"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginHorizontal="2dp"
-            android:layout_marginVertical="2dp"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
             android:layout_gravity="center"
             android:visibility="invisible"
-            app:cardBackgroundColor="?attr/colorSurface">
+            app:cardBackgroundColor="?attr/colorSurface"
+            app:cardCornerRadius="24dp"
+            app:cardElevation="8dp">
 
             <ImageView
                 android:id="@+id/app_icon"
                 android:layout_width="40dp"
                 android:layout_height="40dp"
+                android:layout_gravity="center"
                 android:contentDescription="@string/collapsed_app_icon"
+                android:padding="3dp"
+                android:scaleType="fitCenter"
                 tools:srcCompat="@tools:sample/avatars" />
         </com.google.android.material.card.MaterialCardView>
 
@@ -116,16 +118,14 @@
             android:id="@+id/cvBackground"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginStart="2dp"
-            android:layout_marginTop="2dp"
-            android:layout_marginEnd="2dp"
-            android:layout_marginBottom="2dp"
             android:layout_gravity="center"
             android:visibility="invisible"
             android:clipChildren="false"
             android:clipToPadding="false"
             app:cardBackgroundColor="?attr/colorSurface"
-            app:strokeWidth="0dp">
+            app:cardElevation="12dp"
+            app:strokeColor="#24FFFFFF"
+            app:strokeWidth="1dp">
 
             <androidx.constraintlayout.widget.ConstraintLayout
                 android:id="@+id/background"
@@ -137,9 +137,12 @@
 
                 <ImageButton
                     android:id="@+id/ibSuper"
-                    android:layout_width="match_parent"
-                    android:layout_height="25dp"
-                    android:background="@null"
+                    android:layout_width="0dp"
+                    android:layout_height="28dp"
+                    android:background="@drawable/hyperos_window_header"
+                    android:backgroundTint="@null"
+                    app:backgroundTint="@null"
+                    android:padding="3dp"
                     android:src="@drawable/three_dot_horiz"
                     app:layout_constraintEnd_toEndOf="parent"
                     app:layout_constraintStart_toStartOf="parent"

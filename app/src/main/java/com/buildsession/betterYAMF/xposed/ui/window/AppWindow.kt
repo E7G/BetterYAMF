@@ -61,16 +61,16 @@ import com.github.kyuubiran.ezxhelper.utils.getObjectAs
 import com.github.kyuubiran.ezxhelper.utils.invokeMethod
 import com.google.android.material.color.MaterialColors
 import com.buildsession.betterYAMF.common.getAttr
+import com.buildsession.betterYAMF.common.model.StartCmd
 import com.buildsession.betterYAMF.common.onException
 import com.buildsession.betterYAMF.common.runMain
 import com.buildsession.betterYAMF.databinding.LeftBackGestureOverlayBinding
 import com.buildsession.betterYAMF.databinding.RightBackGestureOverlayBinding
 import com.buildsession.betterYAMF.databinding.WindowAppBinding
-import kotlinx.coroutines.withContext
 import com.buildsession.betterYAMF.xposed.services.YAMFManager
 import com.buildsession.betterYAMF.xposed.services.YAMFManager.config
+import com.buildsession.betterYAMF.xposed.utils.AppInfoCache
 import com.buildsession.betterYAMF.xposed.utils.Instances
-import com.buildsession.betterYAMF.xposed.utils.RunMainThreadQueue
 import com.buildsession.betterYAMF.xposed.utils.TipUtil
 import com.buildsession.betterYAMF.xposed.utils.animateAlpha
 import com.buildsession.betterYAMF.xposed.utils.animateResize
@@ -79,10 +79,11 @@ import com.buildsession.betterYAMF.xposed.utils.dpToPx
 import com.buildsession.betterYAMF.xposed.utils.getActivityInfoCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.lang.reflect.Method
 import kotlin.math.floor
 import kotlin.math.min
 import kotlin.math.pow
@@ -96,6 +97,7 @@ import androidx.core.graphics.drawable.toDrawable
 class AppWindow(
     val context: Context,
     private val flags: Int,
+    private val startCmd: StartCmd?,
     private val onVirtualDisplayCreated: (AppWindow, Int) -> Unit
 ) :
     TextureView.SurfaceTextureListener, SurfaceHolder.Callback {
@@ -109,10 +111,16 @@ class AppWindow(
     lateinit var bindingRightBackGesture: RightBackGestureOverlayBinding
     private lateinit var virtualDisplay: VirtualDisplay
     
-    var currentTaskId = -1
+    var currentTaskId = startCmd?.taskId ?: -1
     private var isDestroyed = false
+    private val mainScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     private val rotationWatcher = RotationWatcher()
+    private val screenRotationWatcher = object : IRotationWatcher.Stub() {
+        override fun onRotationChanged(rotation: Int) {
+            runMain { keepInScreenAfterRotation(rotation) }
+        }
+    }
     private val surfaceOnTouchListener = SurfaceOnTouchListener()
     private val surfaceOnGenericMotionListener = SurfaceOnGenericMotionListener()
     var displayId = -1
@@ -122,18 +130,38 @@ class AppWindow(
     private var halfWidth = 0
     private var halfHeight = 0
     lateinit var surfaceView: View
-    private var newDpi = calculateDpi(
-        config.defaultWindowWidth, config.defaultWindowHeight,
-        calculateScreenInches(config.defaultWindowWidth, config.defaultWindowHeight)
-    ) - config.reduceDPI
+    private var newDpi = (context.resources.displayMetrics.densityDpi - config.reduceDPI)
+        .coerceAtLeast(72)
+    private var textureSurface: Surface? = null
+    private var bootstrapSurfaceTexture: SurfaceTexture? = null
+    private var bootstrapSurface: Surface? = null
     private var originalWidth: Int = 0
     private var originalHeight: Int = 0
     private var isResize: Boolean = true
     private var orientation = 0
     private var params = WindowManager.LayoutParams()
     private var paramsBg = WindowManager.LayoutParams()
-    private var backGestureJob: Job? = null
     private var keepInScreenAnimator: ValueAnimator? = null
+    private var xFlingAnimation: FlingAnimation? = null
+    private var yFlingAnimation: FlingAnimation? = null
+    private var lastSurfaceWidth = 0
+    private var lastSurfaceHeight = 0
+    private var lastSurfaceDpi = 0
+    private var lastTaskSignature: String? = null
+    private var inputForwardingErrorLogged = false
+    private val homePackage: String? by lazy {
+        context.packageManager.resolveActivity(
+            Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME),
+            PackageManager.MATCH_DEFAULT_ONLY
+        )?.activityInfo?.packageName
+    }
+    private val setInputDisplayId: Method? by lazy {
+        runCatching {
+            Class.forName("android.view.InputEvent")
+                .getDeclaredMethod("setDisplayId", Integer.TYPE)
+                .apply { isAccessible = true }
+        }.getOrNull()
+    }
     private var lastClickTime = 0L
     private val DOUBLE_CLICK_TIME_DELTA: Long = 300
     private var isSuperShown = false
@@ -184,11 +212,40 @@ class AppWindow(
             0 -> {
                 surfaceView = binding.viewSurface
                 binding.viewTexture.visibility = View.GONE
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    binding.viewSurface.setSurfaceLifecycle(
+                        SurfaceView.SURFACE_LIFECYCLE_FOLLOWS_ATTACHMENT
+                    )
+                }
             }
             1 -> {
                 surfaceView = binding.viewTexture
                 binding.viewSurface.visibility = View.GONE
             }
+        }
+
+        // SurfaceView owns a separate compositor layer; the CardView's radius alone
+        // cannot clip it. Extend the outline above the content to round only the bottom.
+        surfaceView.outlineProvider = object : android.view.ViewOutlineProvider() {
+            override fun getOutline(view: View, outline: android.graphics.Outline) {
+                val radius = config.windowRoundedCorner.dpToPx()
+                outline.setRoundRect(0, -radius.toInt(), view.width, view.height, radius)
+            }
+        }
+        surfaceView.clipToOutline = true
+        surfaceView.addOnLayoutChangeListener { view, _, _, _, _, _, _, _, _ -> view.invalidateOutline() }
+        (surfaceView as? SurfaceView)?.let { view ->
+            // SurfaceView also punches a hole in its parent. Its native radius must
+            // match the UI radius, otherwise that hole stays rectangular.
+            runCatching {
+                view.invokeMethod("setCornerRadius", args(config.windowRoundedCorner.dpToPx()), argTypes(Float::class.javaPrimitiveType!!))
+            }.onFailure { Log.w(TAG, "Surface corner radius unavailable", it) }
+        }
+
+        // Show the correct icon immediately. Waiting for a task-stack callback left the
+        // collapsed bubble blank or displaying a previous task's icon.
+        startCmd?.componentName?.let { component ->
+            updateAppIcon(component, startCmd.userId ?: 0)
         }
 
         params = WindowManager.LayoutParams(
@@ -207,7 +264,7 @@ class AppWindow(
         val display = displayManager.getDisplay(Display.DEFAULT_DISPLAY)
         val rotation = display?.rotation ?: Surface.ROTATION_0
         
-        val dm = context.resources.displayMetrics
+        val dm = getRealScreenMetrics()
         val screenWidth = dm.widthPixels
         val screenHeight = dm.heightPixels
         val windowWidth = config.defaultWindowWidth.dpToPx().toInt()
@@ -236,7 +293,14 @@ class AppWindow(
                     y = 0
                 }
             }
+
+            if (startCmd?.fromGesture == true) {
+                val margin = 18.dpToPx().toInt()
+                x = (screenWidth - windowWidth - margin).coerceAtLeast(0)
+                y = 24.dpToPx().toInt().coerceAtMost((screenHeight - windowHeight).coerceAtLeast(0))
+            }
         }
+
 
         paramsBg = WindowManager.LayoutParams(
             20.dpToPx().toInt(),
@@ -268,20 +332,17 @@ class AppWindow(
         binding.root.let { layout ->
             Instances.windowManager.addView(layout, params)
         }
+        runCatching {
+            Instances.iWindowManager.watchRotation(screenRotationWatcher, Display.DEFAULT_DISPLAY)
+        }.onFailure { error ->
+            Log.w(TAG, "Unable to watch main display rotation", error)
+        }
 
         binding.rootClickMask.setOnTouchListener { _, event ->
             moveGestureDetector.onTouchEvent(event)
             moveToTopIfNeed(event)
-            
-            if (event.action == MotionEvent.ACTION_UP || event.action == MotionEvent.ACTION_CANCEL) {
-                when (currentHighlightedCorner) {
-                    in 0..3 -> changeMini()
-                    4, 5 -> changeCollapsed()
-                    else -> keepInScreen()
-                }
-                currentHighlightedCorner = -1
-                hideCornerDropZone()
-            }
+
+            finishMoveGesture(event)
             true
         }
 
@@ -289,8 +350,6 @@ class AppWindow(
             val clickTime = System.currentTimeMillis()
             if (clickTime - lastClickTime < DOUBLE_CLICK_TIME_DELTA) {
                 isResize = false
-                backGestureJob?.cancel()
-                backGestureJob = null
 
                 binding.cvappIcon.visibility = View.INVISIBLE
                 if (orientation == 0) {
@@ -303,21 +362,15 @@ class AppWindow(
                     }
                 }
 
-                CoroutineScope(Dispatchers.IO).launch {
-                    delay(200)
-
-                    withContext(Dispatchers.Main) {
-                        animateScaleThenResize(
-                            binding.cvParent,
-                            1F, 1F,
-                            0F, 0F,
-                            0.5F, 0.5F,
-                            0, 0,
-                            context
-                        ) {
-                            onDestroy()
-                        }
-                    }
+                animateScaleThenResize(
+                    binding.cvParent,
+                    1F, 1F,
+                    0F, 0F,
+                    0.5F, 0.5F,
+                    0, 0,
+                    context
+                ) {
+                    onDestroy()
                 }
             }
             lastClickTime = clickTime
@@ -327,8 +380,6 @@ class AppWindow(
             val clickTime = System.currentTimeMillis()
             if (clickTime - lastClickTime < DOUBLE_CLICK_TIME_DELTA) {
                 isResize = false
-                backGestureJob?.cancel()
-                backGestureJob = null
 
                 binding.cvappIcon.visibility = View.INVISIBLE
                 if (orientation == 0) {
@@ -341,21 +392,15 @@ class AppWindow(
                     }
                 }
 
-                CoroutineScope(Dispatchers.IO).launch {
-                    delay(200)
-
-                    withContext(Dispatchers.Main) {
-                        animateScaleThenResize(
-                            binding.cvParent,
-                            1F, 1F,
-                            0F, 0F,
-                            0.5F, 0.5F,
-                            0, 0,
-                            context
-                        ) {
-                            onDestroy()
-                        }
-                    }
+                animateScaleThenResize(
+                    binding.cvParent,
+                    1F, 1F,
+                    0F, 0F,
+                    0.5F, 0.5F,
+                    0, 0,
+                    context
+                ) {
+                    onDestroy()
                 }
             }
             lastClickTime = clickTime
@@ -364,16 +409,8 @@ class AppWindow(
         binding.ibSuper.setOnTouchListener { _, event ->
             moveGestureDetector.onTouchEvent(event)
             moveToTopIfNeed(event)
-            
-            if (event.action == MotionEvent.ACTION_UP || event.action == MotionEvent.ACTION_CANCEL) {
-                when (currentHighlightedCorner) {
-                    in 0..3 -> changeMini()
-                    4, 5 -> changeCollapsed()
-                    else -> keepInScreen()
-                }
-                currentHighlightedCorner = -1
-                hideCornerDropZone()
-            }
+
+            finishMoveGesture(event)
             false
         }
 
@@ -569,8 +606,6 @@ class AppWindow(
 
         binding.ibClose.setOnClickListener {
             isResize = false
-            backGestureJob?.cancel()
-            backGestureJob = null
 
             binding.cvappIcon.visibility = View.INVISIBLE
             if (orientation == 0) {
@@ -583,21 +618,15 @@ class AppWindow(
                 }
             }
 
-            CoroutineScope(Dispatchers.IO).launch {
-                delay(200)
-
-                withContext(Dispatchers.Main) {
-                    animateScaleThenResize(
-                        binding.cvParent,
-                        1F, 1F,
-                        0F, 0F,
-                        0.5F, 0.5F,
-                        0, 0,
-                        context
-                    ) {
-                        onDestroy()
-                    }
-                }
+            animateScaleThenResize(
+                binding.cvParent,
+                1F, 1F,
+                0F, 0F,
+                0.5F, 0.5F,
+                0, 0,
+                context
+            ) {
+                onDestroy()
             }
         }
 
@@ -638,25 +667,39 @@ class AppWindow(
         }
 
         if (config.windowMode == 0) { // Virtual Display
+            val initialWidth = config.defaultWindowWidth.dpToPx().toInt()
+            val initialHeight = config.defaultWindowHeight.dpToPx().toInt()
+            val effectiveFlags = if (Build.VERSION.SDK_INT >= 37) {
+                flags and (1 shl 9).inv() // VIRTUAL_DISPLAY_FLAG_SHOULD_SHOW_SYSTEM_DECORATIONS
+            } else {
+                flags
+            }
+            bootstrapSurfaceTexture = SurfaceTexture(false).apply {
+                setDefaultBufferSize(initialWidth, initialHeight)
+            }
+            bootstrapSurface = Surface(bootstrapSurfaceTexture)
             virtualDisplay = Instances.displayManager.createVirtualDisplay(
-                "yamf${System.currentTimeMillis()}", config.defaultWindowWidth, config.defaultWindowHeight, newDpi-config.reduceDPI, null, flags
+                "yamf${System.currentTimeMillis()}",
+                initialWidth,
+                initialHeight,
+                newDpi.coerceAtLeast(72),
+                bootstrapSurface,
+                effectiveFlags
             )
+            lastSurfaceWidth = initialWidth
+            lastSurfaceHeight = initialHeight
+            lastSurfaceDpi = newDpi
             displayId = virtualDisplay.display.displayId
+            binding.root.post(::attachRenderingSurfaceIfReady)
             (Instances.windowManager as WindowManagerHidden).setDisplayImePolicy(displayId, if (config.showImeInWindow) WindowManagerHidden.DISPLAY_IME_POLICY_LOCAL else WindowManagerHidden.DISPLAY_IME_POLICY_FALLBACK_DISPLAY)
             
             (surfaceView as? TextureView)?.surfaceTextureListener = this
             (surfaceView as? SurfaceView)?.holder?.addCallback(this)
-            var failCount = 0
-            fun watchRotation() {
-                runCatching {
-                    Instances.iWindowManager.watchRotation(rotationWatcher, displayId)
-                }.onFailure {
-                    failCount++
-                    // Log.d(TAG, "watchRotation: fail $failCount")
-                    watchRotation()
-                }
+            runCatching {
+                Instances.iWindowManager.watchRotation(rotationWatcher, displayId)
+            }.onFailure { error ->
+                Log.w(TAG, "Unable to watch display $displayId rotation", error)
             }
-            watchRotation()
         } else { // Smooth Freeform
             displayId = 0 // Main display
             surfaceView.visibility = View.GONE // Hide the surface view, task renders directly
@@ -675,6 +718,7 @@ class AppWindow(
             this.height = height
         }
         onVirtualDisplayCreated(this, displayId)
+        updateFocusedDisplay(YAMFManager.currentDisplayId)
 
         isResize = false
         binding.cvBackground.post {
@@ -683,6 +727,8 @@ class AppWindow(
             binding.cvBackground.visibility = View.VISIBLE
 
             binding.cvBackground.radius = config.windowRoundedCorner.dpToPx()
+            binding.cvBackground.clipToOutline = true
+            binding.cvParent.clipToOutline = true
             binding.cvappIcon.radius = config.windowRoundedCorner.dpToPx()
 
 
@@ -691,73 +737,71 @@ class AppWindow(
             originalHeight = binding.cvParent.height
             binding.cvParent.visibility = View.VISIBLE
 
-            animateScaleThenResize(
-                binding.cvBackground,
-                0F, 0F,
-                1F, 1F,
-                0.5F, 0.5F,
-                originalWidth, originalHeight,
-                context
-            ) {
+            if (startCmd?.fromGesture == true) {
                 setBackgroundWrapContent()
-
-                CoroutineScope(Dispatchers.Main).launch {
-                    delay(200)
-
-                    binding.cvParent.strokeWidth = 2.dpToPx().toInt()
-                }
-
+                binding.cvBackground.scaleX = 1f
+                binding.cvBackground.scaleY = 1f
+                binding.root.alpha = 1f
+                binding.cvParent.strokeWidth = 1.dpToPx().toInt()
                 isResize = true
+            } else {
+                animateScaleThenResize(
+                    binding.cvBackground,
+                    0F, 0F,
+                    1F, 1F,
+                    0.5F, 0.5F,
+                    originalWidth, originalHeight,
+                    context
+                ) {
+                    setBackgroundWrapContent()
+
+                    mainScope.launch {
+                        delay(200)
+                        if (isDestroyed) return@launch
+                        binding.cvParent.strokeWidth = 1.dpToPx().toInt()
+                    }
+
+                    isResize = true
+                }
             }
         }
 
-        //TODO: Find me a better alternative for less resource usage instead of polling
-        backGestureJob = CoroutineScope(Dispatchers.IO).launch {
-            while (isActive) {
-                if (config.windowMode == 1) { // In smooth mode, we don't handle back gestures here for now
-                    delay(1000)
-                    continue
-                }
-                if (isMini || isCollapsed) {
-                    withContext(Dispatchers.Main) {
-                        bindingLeftBackGesture.root.visibility = View.GONE
-                        bindingRightBackGesture.root.visibility = View.GONE
-                    }
-                } else if (displayId == YAMFManager.currentDisplayId) {
-                    withContext(Dispatchers.Main) {
-                        bindingLeftBackGesture.root.visibility = View.VISIBLE
-                        bindingRightBackGesture.root.visibility = View.VISIBLE
-                    }
-                } else {
-                    withContext(Dispatchers.Main) {
-                        bindingLeftBackGesture.root.visibility = View.GONE
-                        bindingRightBackGesture.root.visibility = View.GONE
-                    }
-                }
+    }
 
-                if (!isMini && !isCollapsed) {
-                    withContext(Dispatchers.Main) {
-                        if (orientation == 0) {
-                            binding.rlBarControllerBottom.visibility = View.VISIBLE
-                        } else {
-                            binding.rlBarControllerSide.visibility = View.VISIBLE
-                        }
-                    }
-                }
-                delay(500)
-            }
+    /** Updates chrome immediately when focus changes; replaces a permanent 500 ms polling loop. */
+    fun updateFocusedDisplay(focusedDisplayId: Int) {
+        if (isDestroyed || !::binding.isInitialized) return
+        val showGestures = config.windowMode == 0 && !isMini && !isCollapsed &&
+            focusedDisplayId == displayId
+        bindingLeftBackGesture.root.visibility = if (showGestures) View.VISIBLE else View.GONE
+        bindingRightBackGesture.root.visibility = if (showGestures) View.VISIBLE else View.GONE
+
+        if (!isMini && !isCollapsed) {
+            binding.rlBarControllerBottom.visibility = if (orientation == 0) View.VISIBLE else View.GONE
+            binding.rlBarControllerSide.visibility = if (orientation == 1) View.VISIBLE else View.GONE
         }
     }
 
     fun onDestroy() {
         if (isDestroyed) return
         isDestroyed = true
-        
+
+        mainScope.cancel()
+        keepInScreenAnimator?.cancel()
+        xFlingAnimation?.cancel()
+        yFlingAnimation?.cancel()
+        surfaceView.animate().cancel()
+        binding.cvParent.animate().cancel()
+
         runCatching { context.unregisterReceiver(broadcastReceiver) }
         runCatching { Instances.iWindowManager.removeRotationWatcher(rotationWatcher) }
+        runCatching { Instances.iWindowManager.removeRotationWatcher(screenRotationWatcher) }
         
         YAMFManager.removeWindow(displayId)
         if (config.windowMode == 0) {
+            textureSurface?.release()
+            textureSurface = null
+            releaseBootstrapSurface()
             runCatching { virtualDisplay.release() }
         } else {
             // In smooth mode, if the task is still alive, we should move it back to full screen or close it
@@ -768,17 +812,17 @@ class AppWindow(
         
         runMain {
             if (binding.root.isAttachedToWindow) {
-                runCatching { Instances.windowManager.removeView(binding.root) }
+                runCatching { Instances.windowManager.removeViewImmediate(binding.root) }
             }
             if (bindingLeftBackGesture.root.isAttachedToWindow) {
-                runCatching { Instances.windowManager.removeView(bindingLeftBackGesture.root) }
+                runCatching { Instances.windowManager.removeViewImmediate(bindingLeftBackGesture.root) }
             }
             if (bindingRightBackGesture.root.isAttachedToWindow) {
-                runCatching { Instances.windowManager.removeView(bindingRightBackGesture.root) }
+                runCatching { Instances.windowManager.removeViewImmediate(bindingRightBackGesture.root) }
             }
             cornerDropZoneView?.let {
                 if (it.isAttachedToWindow) {
-                    runCatching { Instances.windowManager.removeView(it) }
+                    runCatching { Instances.windowManager.removeViewImmediate(it) }
                 }
                 cornerDropZoneView = null
             }
@@ -839,104 +883,56 @@ class AppWindow(
 
     private fun updateTask(taskInfo: ActivityManager.RunningTaskInfo) {
         currentTaskId = taskInfo.taskId
-        RunMainThreadQueue.add {
-            if (taskInfo.isVisible.not()) {
-                delay(500) // fixme: use a method that directly determines visibility
-            }
+        val topActivity = taskInfo.topActivity ?: taskInfo.baseActivity ?: return
+        val taskDescription = taskInfo.taskDescription
+        val backgroundColor = taskDescription?.backgroundColor ?: Color.TRANSPARENT
+        val signature = "${taskInfo.taskId}:$topActivity:$backgroundColor"
+        if (signature == lastTaskSignature) return
+        lastTaskSignature = signature
 
-            var backgroundColor = 0
-            var statusBarColor = 0
-            var navigationBarColor = 0
-            var taskDescription: ActivityManager.TaskDescription?
+        val userId = runCatching { taskInfo.getObjectAs<Int>("userId") }.getOrDefault(0)
+        updateAppIcon(topActivity, userId)
 
-            if (Build.VERSION.SDK_INT < 35) {
-                val topActivity = taskInfo.topActivity ?: return@add
-                taskDescription = Instances.activityTaskManager.getTaskDescription(taskInfo.taskId) ?: return@add
-                val activityInfo = (Instances.iPackageManager as IPackageManagerHidden).getActivityInfoCompat(topActivity, 0, taskInfo.getObjectAs("userId"))
+        val statusBarColor = backgroundColor
+        val navigationBarColor = backgroundColor
 
-                backgroundColor = taskDescription.backgroundColor
-                statusBarColor = taskDescription.backgroundColor
-                navigationBarColor = taskDescription.backgroundColor
-                
-                val iconDrawable = runCatching { taskDescription.icon }.getOrNull()?.let { BitmapDrawable(context.resources, it) } 
-                    ?: activityInfo.loadIcon(Instances.packageManager)
-                
-                binding.appIcon.setImageDrawable(iconDrawable)
-                binding.appIcon.scaleType = ImageView.ScaleType.CENTER_CROP
+        if (config.coloredController) {
+            val onStateBar = if (MaterialColors.isColorLight(ColorUtils.compositeColors(statusBarColor, backgroundColor)) xor ((context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES)) {
+                context.theme.getAttr(com.google.android.material.R.attr.colorOnPrimaryContainer).data
             } else {
-                val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-                val runningTasks = activityManager.getRunningTasks(5)
-
-                for (task in runningTasks) {
-                    if (task.taskId == taskInfo.taskId) {
-                        val packageName = task.baseActivity?.packageName
-                        try {
-                            val packageManager = context.packageManager
-                            backgroundColor = task.taskDescription!!.backgroundColor
-                            statusBarColor = task.taskDescription!!.backgroundColor
-                            navigationBarColor = task.taskDescription!!.backgroundColor
-                            val iconDrawable = packageManager.getApplicationIcon(packageName!!)
-                            binding.appIcon.setImageDrawable(iconDrawable)
-                            binding.appIcon.scaleType = ImageView.ScaleType.CENTER_CROP
-                        } catch (e: PackageManager.NameNotFoundException) {
-                            e.printStackTrace()
-                        }
-                    }
-                }
+                context.theme.getAttr(com.google.android.material.R.attr.colorOnPrimary).data
             }
 
-            if (config.coloredController) {
-                val onStateBar = if (MaterialColors.isColorLight(ColorUtils.compositeColors(statusBarColor, backgroundColor)) xor ((context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES)) {
-                    context.theme.getAttr(com.google.android.material.R.attr.colorOnPrimaryContainer).data
-                } else {
-                    context.theme.getAttr(com.google.android.material.R.attr.colorOnPrimary).data
-                }
+            binding.ibClose.imageTintList = ColorStateList.valueOf(onStateBar)
+            binding.background.setBackgroundColor(navigationBarColor)
 
-                binding.ibClose.imageTintList = ColorStateList.valueOf(onStateBar)
-                binding.background.setBackgroundColor(navigationBarColor)
-
-                val onNavigationBar = if (MaterialColors.isColorLight(ColorUtils.compositeColors(navigationBarColor, backgroundColor)) xor ((context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES)) {
-                    context.theme.getAttr(com.google.android.material.R.attr.colorOnPrimaryContainer).data
-                } else {
-                    context.theme.getAttr(com.google.android.material.R.attr.colorOnPrimary).data
-                }
-
-                binding.ibMinimize.imageTintList = ColorStateList.valueOf(onNavigationBar)
-                binding.ibFullscreen.imageTintList = ColorStateList.valueOf(onNavigationBar)
-                binding.ibRightResize.imageTintList = ColorStateList.valueOf(onNavigationBar)
+            val onNavigationBar = if (MaterialColors.isColorLight(ColorUtils.compositeColors(navigationBarColor, backgroundColor)) xor ((context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES)) {
+                context.theme.getAttr(com.google.android.material.R.attr.colorOnPrimaryContainer).data
+            } else {
+                context.theme.getAttr(com.google.android.material.R.attr.colorOnPrimary).data
             }
+
+            binding.ibMinimize.imageTintList = ColorStateList.valueOf(onNavigationBar)
+            binding.ibFullscreen.imageTintList = ColorStateList.valueOf(onNavigationBar)
+            binding.ibRightResize.imageTintList = ColorStateList.valueOf(onNavigationBar)
+        }
+    }
+
+    private fun updateAppIcon(componentName: android.content.ComponentName, userId: Int) {
+        runCatching {
+            val activityInfo = (Instances.iPackageManager as IPackageManagerHidden)
+                .getActivityInfoCompat(componentName, 0, userId)
+            binding.appIcon.setImageDrawable(AppInfoCache.getIcon(activityInfo))
+            binding.appIcon.scaleType = ImageView.ScaleType.FIT_CENTER
+        }.onFailure { error ->
+            Log.w(TAG, "Unable to load icon for $componentName", error)
         }
     }
 
     fun onTaskMovedToFront(taskInfo: ActivityManager.RunningTaskInfo) {
         val taskDisplayId = runCatching { taskInfo.getObject("displayId") as Int }.getOrDefault(-1)
         if (taskDisplayId == displayId) {
-            // 检测是否回到了桌面 (Home Activity)，如果是则自动关闭小窗
-            // ACTIVITY_TYPE_HOME = 2
-            val activityType = runCatching {
-                val config = taskInfo.getObject("configuration")
-                val windowConfig = config.getObject("windowConfiguration")
-                windowConfig.invokeMethod("getActivityType") as Int
-            }.getOrElse {
-                // 兜底逻辑：通过 topActivity 的包名判断是否为桌面
-                val topActivity = taskInfo.topActivity
-                if (topActivity != null) {
-                    val pkg = topActivity.packageName
-                    val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
-                    val resolveInfo = context.packageManager.resolveActivity(intent, PackageManager.MATCH_DEFAULT_ONLY)
-                    val defaultLauncher = resolveInfo?.activityInfo?.packageName
-                    
-                    // 1. 检查是否为默认桌面
-                    // 2. 检查常见 Launcher 包名
-                    // 3. 模糊匹配包含 launcher 的包名 (排除某些系统组件)
-                    if (pkg == defaultLauncher || 
-                        pkg == "com.android.launcher3" || 
-                        pkg == "com.google.android.apps.nexuslauncher" ||
-                        (pkg.contains("launcher", ignoreCase = true) && !pkg.contains("service", ignoreCase = true))) 2 else 0
-                } else 0
-            }
-
-            if (activityType == 2) {
+            if (isHomeTask(taskInfo)) {
                 onDestroy()
                 return
             }
@@ -951,27 +947,8 @@ class AppWindow(
             if(!taskInfo.isVisible){
                 return
             }
-            
-            // 同样增加桌面检测，防止某些情况下 onTaskMovedToFront 未触发
-            val activityType = runCatching {
-                val config = taskInfo.getObject("configuration")
-                val windowConfig = config.getObject("windowConfiguration")
-                windowConfig.invokeMethod("getActivityType") as Int
-            }.getOrElse {
-                val topActivity = taskInfo.topActivity
-                if (topActivity != null) {
-                    val pkg = topActivity.packageName
-                    val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
-                    val resolveInfo = context.packageManager.resolveActivity(intent, PackageManager.MATCH_DEFAULT_ONLY)
-                    val defaultLauncher = resolveInfo?.activityInfo?.packageName
-                    if (pkg == defaultLauncher || 
-                        pkg == "com.android.launcher3" || 
-                        pkg == "com.google.android.apps.nexuslauncher" ||
-                        (pkg.contains("launcher", ignoreCase = true) && !pkg.contains("service", ignoreCase = true))) 2 else 0
-                } else 0
-            }
 
-            if (activityType == 2) {
+            if (isHomeTask(taskInfo)) {
                 onDestroy()
                 return
             }
@@ -1017,43 +994,42 @@ class AppWindow(
                 binding.rlBarControllerBottom.isVisible = false
             }
             
-            // After rotation, make sure the window is still in screen
-            keepInScreen(animate = false)
+            // Rotation callback can precede new display metrics and WRAP_CONTENT layout.
+            // Re-clamp over several frames with bounds corrected for this rotation.
+            keepInScreenAfterRotation(rotation)
         }
     }
 
     override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
-        if (isMini.not() && isCollapsed.not()) {
-            newDpi = calculateDpi(width, height, calculateScreenInches(width, height)) - config.reduceDPI
-            virtualDisplay.resize(width, height, newDpi)
-            surface.setDefaultBufferSize(width, height)
+        val targetWidth = if (!isMini && !isCollapsed) width else width * 2 + halfWidth
+        val targetHeight = if (!isMini && !isCollapsed) height else height * 2 + halfHeight
+        if (!isMini && !isCollapsed) {
             halfWidth = width % 2
             halfHeight = height % 2
-        } else {
-            newDpi = calculateDpi(width, height, calculateScreenInches(width, height)) - config.reduceDPI
-            virtualDisplay.resize(width * 2 + halfWidth, height * 2 + halfHeight, newDpi)
-            surface.setDefaultBufferSize(width * 2 + halfWidth, height * 2 + halfHeight)
         }
-        virtualDisplay.surface = Surface(surface)
+        resizeVirtualDisplay(targetWidth, targetHeight)
+        surface.setDefaultBufferSize(targetWidth, targetHeight)
+        textureSurface?.release()
+        textureSurface = Surface(surface).also { virtualDisplay.surface = it }
+        releaseBootstrapSurface()
     }
 
     override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
-        if (isResize) {
-            if (isMini.not()) {
-                newDpi = calculateDpi(width, height, calculateScreenInches(width, height)) - config.reduceDPI
-                virtualDisplay.resize(width, height, newDpi)
-                surface.setDefaultBufferSize(width, height)
-                halfWidth = width % 2
-                halfHeight = height % 2
-            } else {
-                newDpi = calculateDpi(width, height, calculateScreenInches(width, height)) - config.reduceDPI
-                virtualDisplay.resize(width * 2 + halfWidth, height * 2 + halfHeight, newDpi)
-                surface.setDefaultBufferSize(width * 2 + halfWidth, height * 2 + halfHeight)
-            }
+        if (!isResize) return
+        val targetWidth = if (!isMini) width else width * 2 + halfWidth
+        val targetHeight = if (!isMini) height else height * 2 + halfHeight
+        if (!isMini) {
+            halfWidth = width % 2
+            halfHeight = height % 2
         }
+        resizeVirtualDisplay(targetWidth, targetHeight)
+        surface.setDefaultBufferSize(targetWidth, targetHeight)
     }
 
     override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
+        if (::virtualDisplay.isInitialized) virtualDisplay.surface = null
+        textureSurface?.release()
+        textureSurface = null
         return true
     }
 
@@ -1061,20 +1037,81 @@ class AppWindow(
 
     }
 
-    private fun keepInScreen(animate: Boolean = true) {
+    private fun resizeVirtualDisplay(width: Int, height: Int) {
+        if (isDestroyed || !::virtualDisplay.isInitialized || width <= 0 || height <= 0) return
+        if (lastSurfaceWidth == width && lastSurfaceHeight == height && lastSurfaceDpi == newDpi) return
+        virtualDisplay.resize(width, height, newDpi)
+        lastSurfaceWidth = width
+        lastSurfaceHeight = height
+        lastSurfaceDpi = newDpi
+    }
+
+    private fun getRealScreenMetrics(): android.util.DisplayMetrics {
+        return android.util.DisplayMetrics().also { metrics ->
+            context.display?.getRealMetrics(metrics)
+            if (metrics.widthPixels <= 0 || metrics.heightPixels <= 0) {
+                metrics.setTo(context.resources.displayMetrics)
+            }
+        }
+    }
+
+    private fun finishMoveGesture(event: MotionEvent) {
+        if (event.action != MotionEvent.ACTION_UP && event.action != MotionEvent.ACTION_CANCEL) return
+
+        xFlingAnimation?.cancel()
+        yFlingAnimation?.cancel()
+        val dropTarget = currentHighlightedCorner
+        currentHighlightedCorner = -1
+        hideCornerDropZone()
+
+        if (event.action == MotionEvent.ACTION_CANCEL) {
+            keepInScreen()
+            return
+        }
+        when (dropTarget) {
+            in 0..3 -> changeMini(dropTarget)
+            4, 5 -> changeCollapsed()
+            else -> keepInScreen()
+        }
+    }
+
+    private fun getScreenSize(expectedRotation: Int? = null): Pair<Int, Int> {
+        val metrics = getRealScreenMetrics()
+        var width = metrics.widthPixels
+        var height = metrics.heightPixels
+        if (expectedRotation != null) {
+            val expectedLandscape = expectedRotation == Surface.ROTATION_90 ||
+                    expectedRotation == Surface.ROTATION_270
+            if (expectedLandscape != (width > height)) {
+                val oldWidth = width
+                width = height
+                height = oldWidth
+            }
+        }
+        return width to height
+    }
+
+    private fun keepInScreenAfterRotation(rotation: Int, pass: Int = 0) {
+        binding.root.postOnAnimation {
+            keepInScreen(animate = false, expectedRotation = rotation)
+            if (pass < 2) {
+                binding.root.postDelayed({ keepInScreenAfterRotation(rotation, pass + 1) }, 32L)
+            }
+        }
+    }
+
+    private fun keepInScreen(animate: Boolean = true, expectedRotation: Int? = null) {
         binding.root.post {
             val params = binding.root.layoutParams as WindowManager.LayoutParams
-            val displayMetrics = context.resources.displayMetrics
-            val screenWidth = displayMetrics.widthPixels
-            val screenHeight = displayMetrics.heightPixels
+            val (screenWidth, screenHeight) = getScreenSize(expectedRotation)
 
             val windowWidth = binding.root.width
             val windowHeight = binding.root.height
 
             val minX = 0
             val minY = 0
-            val maxX = screenWidth - windowWidth
-            val maxY = screenHeight - windowHeight
+            val maxX = (screenWidth - windowWidth).coerceAtLeast(0)
+            val maxY = (screenHeight - windowHeight).coerceAtLeast(0)
 
             val targetX = params.x.coerceIn(minX, maxX)
             val targetY = params.y.coerceIn(minY, maxY)
@@ -1130,7 +1167,7 @@ class AppWindow(
             view, startWidth, endWidth, startHeight, endHeight, context,
             onUpdate = { currentViewWidth, currentViewHeight ->
                 val currentParams = binding.root.layoutParams as WindowManager.LayoutParams
-                val displayMetrics = context.resources.displayMetrics
+                val displayMetrics = getRealScreenMetrics()
                 val screenWidth = displayMetrics.widthPixels
                 val screenHeight = displayMetrics.heightPixels
                 
@@ -1141,8 +1178,8 @@ class AppWindow(
                 val targetX = centerX - currentWindowWidth / 2
                 val targetY = centerY - currentWindowHeight / 2
                 
-                currentParams.x = targetX.coerceIn(0, screenWidth - currentWindowWidth)
-                currentParams.y = targetY.coerceIn(0, screenHeight - currentWindowHeight)
+                currentParams.x = targetX.coerceIn(0, (screenWidth - currentWindowWidth).coerceAtLeast(0))
+                currentParams.y = targetY.coerceIn(0, (screenHeight - currentWindowHeight).coerceAtLeast(0))
                 
                 runCatching {
                     Instances.windowManager.updateViewLayout(binding.root, currentParams)
@@ -1153,15 +1190,16 @@ class AppWindow(
     }
 
     // minimizes the floating window a bar-less only-content floating window
-    private fun changeMini() {
+    private fun changeMini(targetCorner: Int? = null) {
+        xFlingAnimation?.cancel()
+        yFlingAnimation?.cancel()
+        cancelVirtualDisplayTouch()
         isCollapsed = false
         isResize = false
 
         if (isMini) {
             isMini = false
             isResize = true
-            binding.rootClickMask.visibility = View.GONE
-
             if (surfaceView is SurfaceView) {
                 binding.cvBackground.updateLayoutParams {
                     width = originalWidth
@@ -1204,9 +1242,7 @@ class AppWindow(
             } else {
                 binding.rlBarControllerSide.visibility = View.VISIBLE
             }
-            surfaceView.visibility = View.VISIBLE
-            surfaceView.setOnTouchListener(surfaceOnTouchListener)
-            surfaceView.setOnGenericMotionListener(surfaceOnGenericMotionListener)
+            restoreSurfaceInteraction()
 
             return
         }
@@ -1221,7 +1257,7 @@ class AppWindow(
                     width = originalWidth/2
                     height = originalHeight/2
                 }
-                keepInScreen()
+                if (targetCorner != null) snapMiniToCorner(targetCorner) else keepInScreen()
             } else {
                 animateResizeCentered(
                     binding.cvBackground,
@@ -1231,7 +1267,7 @@ class AppWindow(
                     isResize = true
                     bindingLeftBackGesture.root.visibility = View.GONE
                     bindingRightBackGesture.root.visibility = View.GONE
-                    keepInScreen()
+                    if (targetCorner != null) snapMiniToCorner(targetCorner) else keepInScreen()
                 }
             }
 
@@ -1258,9 +1294,9 @@ class AppWindow(
     }
 
     private fun changeCollapsed() {
+        cancelVirtualDisplayTouch()
         isResize = false
         if (isCollapsed) {
-            binding.rootClickMask.visibility = View.GONE
             expandWindow()
             bindingLeftBackGesture.root.visibility = View.VISIBLE
             bindingRightBackGesture.root.visibility = View.VISIBLE
@@ -1277,6 +1313,7 @@ class AppWindow(
     private fun expandWindow() {
         isCollapsed = false
         binding.background.visibility = View.VISIBLE
+        binding.cvParent.setContentPadding(0, 0, 0, 0)
 
         animateResizeCentered(
             binding.appIcon, 40.dpToPx().toInt(), 0, 40.dpToPx().toInt(), 0) {
@@ -1284,42 +1321,71 @@ class AppWindow(
             animateResizeCentered(binding.cvBackground, 0, originalWidth, 0, originalHeight) {
                 setBackgroundWrapContent()
                 setParrentWrapContent()
-                binding.cvappIcon.visibility = View.VISIBLE
-
-                CoroutineScope(Dispatchers.Main).launch {
-                    delay(200)
-
-                    if (orientation == 0) {
-                        binding.rlBarControllerBottom.visibility = View.VISIBLE
-                    } else {
-                        binding.rlBarControllerSide.visibility = View.VISIBLE
-                    }
+                if (orientation == 0) {
+                    binding.rlBarControllerBottom.visibility = View.VISIBLE
+                } else {
+                    binding.rlBarControllerSide.visibility = View.VISIBLE
                 }
 
                 binding.cvappIcon.visibility = View.GONE
                 isResize = true
                 keepInScreen()
+                restoreSurfaceInteraction()
             }
         }
     }
 
     private fun collapseWindow() {
         isCollapsed = true
+        binding.cvParent.setContentPadding(0, 0, 0, 0)
 
-        CoroutineScope(Dispatchers.Main).launch {
-            delay(200)
-
-            animateResizeCentered(binding.cvBackground, binding.cvBackground.width, 0, binding.cvBackground.height, 0) {
-                binding.cvappIcon.visibility = View.VISIBLE
-                binding.cvappIcon.radius = 20.dpToPx() // 使其变成圆球 (40dp的一半)
-                binding.background.visibility = View.GONE
-                animateResizeCentered(binding.appIcon, 0, 40.dpToPx().toInt(), 0, 40.dpToPx().toInt()) {
-                    keepInScreen()
-                }
-
-                isResize = true
+        animateResizeCentered(binding.cvBackground, binding.cvBackground.width, 0, binding.cvBackground.height, 0) {
+            binding.cvappIcon.visibility = View.VISIBLE
+            binding.cvappIcon.radius = 24.dpToPx()
+            binding.background.visibility = View.GONE
+            animateResizeCentered(binding.appIcon, 0, 40.dpToPx().toInt(), 0, 40.dpToPx().toInt()) {
+                keepInScreen()
             }
+
+            isResize = true
         }
+    }
+
+    private fun snapMiniToCorner(corner: Int) {
+        binding.root.post {
+            if (isDestroyed || !isMini) return@post
+            val metrics = getRealScreenMetrics()
+            val maxX = (metrics.widthPixels - binding.root.width).coerceAtLeast(0)
+            val maxY = (metrics.heightPixels - binding.root.height).coerceAtLeast(0)
+            val margin = 12.dpToPx().toInt()
+            val params = binding.root.layoutParams as WindowManager.LayoutParams
+            params.x = if (corner == 1 || corner == 3) {
+                (maxX - margin).coerceAtLeast(0)
+            } else {
+                margin.coerceAtMost(maxX)
+            }
+            params.y = if (corner == 2 || corner == 3) {
+                (maxY - margin).coerceAtLeast(0)
+            } else {
+                margin.coerceAtMost(maxY)
+            }
+            runCatching { Instances.windowManager.updateViewLayout(binding.root, params) }
+        }
+    }
+
+    private fun isHomeTask(taskInfo: ActivityManager.RunningTaskInfo): Boolean {
+        val activityType = runCatching {
+            val configuration = taskInfo.getObject("configuration")
+            val windowConfig = configuration.getObject("windowConfiguration")
+            windowConfig.invokeMethod("getActivityType") as Int
+        }.getOrDefault(0)
+        if (activityType == 2) return true // ACTIVITY_TYPE_HOME
+
+        val pkg = taskInfo.topActivity?.packageName ?: return false
+        return pkg == homePackage || pkg == "com.android.launcher3" ||
+            pkg == "com.google.android.apps.nexuslauncher" ||
+            (pkg.contains("launcher", ignoreCase = true) &&
+                !pkg.contains("service", ignoreCase = true))
     }
 
     private fun calculateScreenInches(width: Int, height: Int): Float {
@@ -1362,16 +1428,19 @@ class AppWindow(
                     MotionEvent.ACTION_MOVE -> {
                         offsetX = event.rawX - beginX
                         offsetY = event.rawY - beginY
+                        val metrics = context.resources.displayMetrics
+                        val minWidth = 180.dpToPx().toInt()
+                        val minHeight = 220.dpToPx().toInt()
+                        val maxWidth = (metrics.widthPixels - params.x.coerceAtLeast(0))
+                            .coerceAtLeast(minWidth)
+                        val maxHeight = (metrics.heightPixels - params.y.coerceAtLeast(0))
+                            .coerceAtLeast(minHeight)
                         binding.vSizePreviewer.updateLayoutParams {
-                            val targetWidth = beginWidth + offsetX.toInt()
-                            if (targetWidth > 0)
-                                width = targetWidth
-                            val targetHeight = beginHeight + offsetY.toInt()
-                            if (targetHeight > 0)
-                                height = targetHeight
+                            width = (beginWidth + offsetX.toInt()).coerceIn(minWidth, maxWidth)
+                            height = (beginHeight + offsetY.toInt()).coerceIn(minHeight, maxHeight)
                         }
                     }
-                    MotionEvent.ACTION_UP -> {
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                         binding.vSizePreviewer.post {
                             surfaceView.updateLayoutParams {
                                 width = binding.vSizePreviewer.width
@@ -1393,10 +1462,64 @@ class AppWindow(
     fun forwardMotionEvent(event: MotionEvent) {
         if (!isSuperShown) {
             val newEvent = MotionEvent.obtain(event)
-            newEvent.invokeMethod("setDisplayId", args(displayId), argTypes(Integer.TYPE))
-            Instances.inputManager.injectInputEvent(newEvent, 0)
-            newEvent.recycle()
+            try {
+                val method = setInputDisplayId
+                val setDirectly = method != null && runCatching {
+                    method.invoke(newEvent, displayId)
+                }.isSuccess
+                if (!setDirectly) {
+                    newEvent.invokeMethod("setDisplayId", args(displayId), argTypes(Integer.TYPE))
+                }
+                Instances.inputManager.injectInputEvent(newEvent, 0)
+            } catch (error: Throwable) {
+                if (!inputForwardingErrorLogged) {
+                    inputForwardingErrorLogged = true
+                    Log.e(TAG, "Unable to forward input to display $displayId", error)
+                }
+            } finally {
+                newEvent.recycle()
+            }
         }
+    }
+
+    private fun cancelVirtualDisplayTouch() {
+        if (config.windowMode != 0 || displayId < 0) return
+        val now = SystemClock.uptimeMillis()
+        val cancel = MotionEvent.obtain(now, now, MotionEvent.ACTION_CANCEL, 0f, 0f, 0).apply {
+            source = InputDevice.SOURCE_TOUCHSCREEN
+        }
+        try {
+            val method = setInputDisplayId
+            val setDirectly = method != null && runCatching {
+                method.invoke(cancel, displayId)
+            }.isSuccess
+            if (!setDirectly) {
+                cancel.invokeMethod("setDisplayId", args(displayId), argTypes(Integer.TYPE))
+            }
+            Instances.inputManager.injectInputEvent(cancel, 0)
+        } catch (error: Throwable) {
+            Log.e(TAG, "Unable to cancel display input $displayId", error)
+        } finally {
+            cancel.recycle()
+        }
+    }
+
+    private fun restoreSurfaceInteraction() {
+        isSuperShown = false
+        binding.clSuperLayout.animate().cancel()
+        binding.clSuperLayout.visibility = View.GONE
+        binding.rootClickMask.visibility = View.GONE
+        surfaceView.visibility = View.VISIBLE
+        surfaceView.isEnabled = true
+        surfaceView.isClickable = true
+        surfaceView.setOnTouchListener(surfaceOnTouchListener)
+        surfaceView.setOnGenericMotionListener(surfaceOnGenericMotionListener)
+        (surfaceView as? SurfaceView)?.holder?.surface?.takeIf { it.isValid }?.let { surface ->
+            if (!isDestroyed && ::virtualDisplay.isInitialized) virtualDisplay.surface = surface
+        }
+        cancelVirtualDisplayTouch()
+        YAMFManager.moveToTop(displayId)
+        updateFocusedDisplay(displayId)
     }
 
     inner class SurfaceOnTouchListener : View.OnTouchListener {
@@ -1419,32 +1542,61 @@ class AppWindow(
     }
 
     override fun surfaceCreated(holder: SurfaceHolder) {
-        virtualDisplay.surface = holder.surface
+        if (!isDestroyed && ::virtualDisplay.isInitialized) {
+            virtualDisplay.surface = holder.surface
+            releaseBootstrapSurface()
+        }
+    }
+
+    private fun releaseBootstrapSurface() {
+        bootstrapSurface?.release()
+        bootstrapSurface = null
+        bootstrapSurfaceTexture?.release()
+        bootstrapSurfaceTexture = null
+    }
+
+    private fun attachRenderingSurfaceIfReady() {
+        if (isDestroyed || !::virtualDisplay.isInitialized) return
+        when (val view = surfaceView) {
+            is SurfaceView -> {
+                if (view.holder.surface.isValid) {
+                    virtualDisplay.surface = view.holder.surface
+                    releaseBootstrapSurface()
+                } else {
+                    binding.root.postDelayed(::attachRenderingSurfaceIfReady, 16L)
+                }
+            }
+            is TextureView -> {
+                view.surfaceTexture?.let { surfaceTexture ->
+                    textureSurface?.release()
+                    textureSurface = Surface(surfaceTexture).also { virtualDisplay.surface = it }
+                    releaseBootstrapSurface()
+                }
+            }
+        }
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        newDpi = calculateDpi(width, height, calculateScreenInches(width, height )) - config.reduceDPI
-        virtualDisplay.resize(width, height, newDpi)
+        resizeVirtualDisplay(width, height)
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
-        virtualDisplay.surface = null
+        if (!isDestroyed && ::virtualDisplay.isInitialized) {
+            virtualDisplay.surface = null
+        }
     }
 
     private val moveGestureDetector = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
         var startX = 0
         var startY = 0
-        var xAnimation: FlingAnimation? = null
-        var yAnimation: FlingAnimation? = null
-        private var keepInScreenAnimator: ValueAnimator? = null
         var lastX = 0F
         var lastY = 0F
         var last2X = 0F
         var last2Y = 0F
 
         override fun onDown(e: MotionEvent): Boolean {
-            xAnimation?.cancel()
-            yAnimation?.cancel()
+            xFlingAnimation?.cancel()
+            yFlingAnimation?.cancel()
             keepInScreenAnimator?.cancel()
             val params = binding.root.layoutParams as WindowManager.LayoutParams
             startX = params.x
@@ -1484,8 +1636,9 @@ class AppWindow(
         ): Boolean {
             e1 ?: return false
             if (e1.source == InputDevice.SOURCE_MOUSE) return false
+            if (currentHighlightedCorner != -1) return false
             val params = binding.root.layoutParams as WindowManager.LayoutParams
-            val displayMetrics = context.resources.displayMetrics
+            val displayMetrics = getRealScreenMetrics()
             val screenWidth = displayMetrics.widthPixels
             val screenHeight = displayMetrics.heightPixels
             val windowWidth = binding.root.width
@@ -1498,7 +1651,7 @@ class AppWindow(
 
             runCatching {
                 if (sign(velocityX) != sign(e2.rawX - last2X)) return@runCatching
-                xAnimation = flingAnimationOf({
+                xFlingAnimation = flingAnimationOf({
                     params.x = it.toInt()
                     runCatching { 
                         Instances.windowManager.updateViewLayout(binding.root, params)
@@ -1516,14 +1669,14 @@ class AppWindow(
                             setMaxValue(maxX)
                         }
                     }
-                xAnimation?.addEndListener { _, _, _, _ ->
+                xFlingAnimation?.addEndListener { _, _, _, _ ->
                     keepInScreen()
                 }
-                xAnimation?.start()
+                xFlingAnimation?.start()
             }
             runCatching {
                 if (sign(velocityY) != sign(e2.rawY - last2Y)) return@runCatching
-                yAnimation = flingAnimationOf({
+                yFlingAnimation = flingAnimationOf({
                     params.y = it.toInt()
                     runCatching { 
                         Instances.windowManager.updateViewLayout(binding.root, params)
@@ -1539,10 +1692,10 @@ class AppWindow(
                             setMaxValue(maxY)
                         }
                     }
-                yAnimation?.addEndListener { _, _, _, _ ->
+                yFlingAnimation?.addEndListener { _, _, _, _ ->
                     keepInScreen()
                 }
-                yAnimation?.start()
+                yFlingAnimation?.start()
             }
             return true
         }
@@ -1583,11 +1736,6 @@ class AppWindow(
     private inner class CornerDropZoneView(context: Context) : View(context) {
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val dashPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-        private fun getRealScreenMetrics(): android.util.DisplayMetrics {
-            val dm = android.util.DisplayMetrics()
-            context.display?.getRealMetrics(dm)
-            return dm
-        }
 
         private val radius: Float
             get() {

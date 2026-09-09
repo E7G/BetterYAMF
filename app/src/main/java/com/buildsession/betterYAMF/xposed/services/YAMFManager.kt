@@ -71,6 +71,7 @@ object YAMFManager : IYAMFManager.Stub() {
     const val SOURCE_RECENT = 1
     const val SOURCE_TASKBAR = 2
     const val SOURCE_POPUP = 3
+    const val SOURCE_GESTURE = 4
 
     val windowList = mutableListOf<Int>()
     private val activeWindows = mutableMapOf<Int, AppWindow>()
@@ -82,8 +83,8 @@ object YAMFManager : IYAMFManager.Stub() {
     private var openWindowCount = 0
     private val iOpenCountListenerSet = mutableSetOf<IOpenCountListener>()
     lateinit var activityManagerService: Any
-    private val listeners = mutableListOf<TopDisplayId>()
     var currentDisplayId = 0
+        private set
 
     private const val WINDOWING_MODE_FULLSCREEN = 1
     private const val WINDOWING_MODE_FREEFORM = 5
@@ -94,7 +95,7 @@ object YAMFManager : IYAMFManager.Stub() {
                 when (method.name) {
                     "onTaskMovedToFront" -> {
                         val taskInfo = args[0] as android.app.ActivityManager.RunningTaskInfo
-                        activeWindows.values.forEach { it.onTaskMovedToFront(taskInfo) }
+                        activeWindows.values.toList().forEach { it.onTaskMovedToFront(taskInfo) }
                         
                         // If a task is moved to front and it's in FREEFORM, and we are in smooth mode,
                         // consider adding it to smoothFreeformTasks if it's not already there.
@@ -117,10 +118,14 @@ object YAMFManager : IYAMFManager.Stub() {
                     }
                     "onTaskDescriptionChanged" -> {
                         val taskInfo = args[0] as android.app.ActivityManager.RunningTaskInfo
-                        activeWindows.values.forEach { it.onTaskDescriptionChanged(taskInfo) }
+                        activeWindows.values.toList().forEach { it.onTaskDescriptionChanged(taskInfo) }
                     }
-                    "onTaskRemovalStarted" -> {
-                        val taskId = args[0] as Int
+                    "onTaskRemovalStarted", "onTaskRemoved" -> {
+                        val taskId = when (val value = args.firstOrNull()) {
+                            is Int -> value
+                            is android.app.ActivityManager.RunningTaskInfo -> value.taskId
+                            else -> return@runMain
+                        }
                         smoothFreeformTasks.remove(taskId)
                         smoothFreeformBounds.remove(taskId)
                         // 过滤：只有当被移除的任务 ID 确实属于某个小窗时才触发销
@@ -158,6 +163,8 @@ object YAMFManager : IYAMFManager.Stub() {
             ActivityManagerApis.broadcastIntent(Intent(HookLauncher.ACTION_RECEIVE_LAUNCHER_CONFIG).apply {
                 // log(TAG, "send config: ${config.hookLauncher}")
                 putExtra(HookLauncher.EXTRA_HOOK_RECENT, config.hookLauncher.hookRecents)
+                putExtra(HookLauncher.EXTRA_WINDOW_WIDTH, config.defaultWindowWidth)
+                putExtra(HookLauncher.EXTRA_WINDOW_HEIGHT, config.defaultWindowHeight)
                 putExtra(HookLauncher.EXTRA_HOOK_TASKBAR, config.hookLauncher.hookTaskbar)
                 putExtra(HookLauncher.EXTRA_HOOK_POPUP, config.hookLauncher.hookPopup)
                 putExtra(HookLauncher.EXTRA_HOOK_TRANSIENT_TASKBAR, config.hookLauncher.hookTransientTaskbar)
@@ -173,9 +180,10 @@ object YAMFManager : IYAMFManager.Stub() {
     }
 
     fun addWindow(id: Int, window: AppWindow) {
+        val isNew = activeWindows.put(id, window) == null
+        windowList.remove(id)
         windowList.add(0, id)
-        activeWindows[id] = window
-        openWindowCount++
+        openWindowCount = activeWindows.size
 
         if (!isTaskStackListenerRegistered) {
             runCatching {
@@ -185,6 +193,10 @@ object YAMFManager : IYAMFManager.Stub() {
             }
         }
 
+        if (isNew) notifyOpenCountChanged()
+    }
+
+    private fun notifyOpenCountChanged() {
         val toRemove = mutableSetOf<IOpenCountListener>()
         iOpenCountListenerSet.forEach {
             runCatching {
@@ -197,14 +209,26 @@ object YAMFManager : IYAMFManager.Stub() {
     }
 
     fun removeWindow(id: Int) {
+        if (activeWindows.remove(id) == null) return
         windowList.remove(id)
-        activeWindows.remove(id)
+        openWindowCount = activeWindows.size
         
         if (activeWindows.isEmpty() && isTaskStackListenerRegistered) {
             runCatching {
                 Instances.activityTaskManager.unregisterTaskStackListener(taskStackListener)
                 isTaskStackListenerRegistered = false
                 // log(TAG, "Global TaskStackListener unregistered (no active windows)")
+            }
+        }
+        notifyOpenCountChanged()
+    }
+
+    fun onFocusedDisplayChanged(displayId: Int) {
+        // InputMonitor calls from android.anim under WM's lock. Never touch Views there.
+        runMain {
+            if (currentDisplayId != displayId) {
+                currentDisplayId = displayId
+                activeWindows.values.toList().forEach { it.updateFocusedDisplay(displayId) }
             }
         }
     }
@@ -228,7 +252,8 @@ object YAMFManager : IYAMFManager.Stub() {
 
         AppWindow(
             CommonContextWrapper.createAppCompatContext(systemUiContext.createContext()),
-            config.flags
+            config.flags,
+            startCmd
         ) { window, displayId ->
             addWindow(displayId, window)
             
@@ -368,7 +393,14 @@ object YAMFManager : IYAMFManager.Stub() {
         runMain {
             val task = getTopRootTask(0) ?: return@runMain
             if (task.baseActivity?.packageName != "com.android.launcher3") {
-                createWindow(StartCmd(taskId = task.taskId))
+                val userId = runCatching { XposedHelpers.getIntField(task, "userId") }.getOrDefault(0)
+                createWindow(
+                    StartCmd(
+                        componentName = task.topActivity ?: task.baseActivity,
+                        userId = userId,
+                        taskId = task.taskId
+                    )
+                )
             }
         }
     }
@@ -482,7 +514,7 @@ object YAMFManager : IYAMFManager.Stub() {
                 intent.getParcelableExtra(EXTRA_COMPONENT_NAME, ComponentName::class.java)
             val userId = intent.getIntExtra(EXTRA_USER_ID, 0)
             val source = intent.getIntExtra(EXTRA_SOURCE, SOURCE_UNSPECIFIED)
-            createWindow(StartCmd(componentName, userId, taskId))
+            createWindow(StartCmd(componentName, userId, taskId, source == SOURCE_GESTURE))
 
             // TODO: better way to close recents
             if (source == SOURCE_RECENT && config.recentBackHome) {

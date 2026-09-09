@@ -11,7 +11,7 @@ plugins {
 
 android {
     val buildTime = System.currentTimeMillis()
-    val baseVersionName = "Preview1.1"
+    val baseVersionName = "Preview1.2-perf6"
     namespace = "com.buildsession.betterYAMF"
     compileSdk = 36
 
@@ -19,7 +19,7 @@ android {
         applicationId = "com.buildsession.betterYAMF"
         minSdk = 33
         targetSdk = 36
-        versionCode = 3
+        versionCode = 10
         versionName = baseVersionName
 
         ndk {
@@ -107,9 +107,6 @@ dependencies {
 
     //glide
     implementation (libs.glide)
-
-    // byte buddy
-    implementation(libs.byte.buddy.android)
 
     //lifecycle service
     implementation(libs.androidx.lifecycle.service)

@@ -2,6 +2,7 @@ package com.buildsession.betterYAMF.manager.ui.setting
 
 import android.content.Intent
 import android.content.SharedPreferences
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.enableEdgeToEdge
@@ -25,21 +26,22 @@ class SettingActivity : AppCompatActivity() {
     private val binding get() = _binding
 
     companion object {
+        private const val API_37 = 37
         val flags = listOf(
-            "VIRTUAL_DISPLAY_FLAG_PUBLIC",                          // 1 << 0
-            "VIRTUAL_DISPLAY_FLAG_PRESENTATION",                    // 1 << 1
-            "VIRTUAL_DISPLAY_FLAG_SECURE",                          // 1 << 2
-            "VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY",                // 1 << 3
-            "VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR",                     // 1 << 4
-            "VIRTUAL_DISPLAY_FLAG_CAN_SHOW_WITH_INSECURE_KEYGUARD", // 1 << 5
-            "VIRTUAL_DISPLAY_FLAG_SUPPORTS_TOUCH",                  // 1 << 6
-            "VIRTUAL_DISPLAY_FLAG_ROTATES_WITH_CONTENT",            // 1 << 7
-            "VIRTUAL_DISPLAY_FLAG_DESTROY_CONTENT_ON_REMOVAL",      // 1 << 8
-            "VIRTUAL_DISPLAY_FLAG_SHOULD_SHOW_SYSTEM_DECORATIONS",  // 1 << 9
-            "VIRTUAL_DISPLAY_FLAG_TRUSTED",                         // 1 << 10
-            "VIRTUAL_DISPLAY_FLAG_OWN_DISPLAY_GROUP",               // 1 << 11
-            "VIRTUAL_DISPLAY_FLAG_ALWAYS_UNLOCKED",                 // 1 << 12
-            "VIRTUAL_DISPLAY_FLAG_TOUCH_FEEDBACK_DISABLED",         // 1 << 13
+            "VIRTUAL_DISPLAY_FLAG_PUBLIC",
+            "VIRTUAL_DISPLAY_FLAG_PRESENTATION",
+            "VIRTUAL_DISPLAY_FLAG_SECURE",
+            "VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY",
+            "VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR",
+            "VIRTUAL_DISPLAY_FLAG_CAN_SHOW_WITH_INSECURE_KEYGUARD",
+            "VIRTUAL_DISPLAY_FLAG_SUPPORTS_TOUCH",
+            "VIRTUAL_DISPLAY_FLAG_ROTATES_WITH_CONTENT",
+            "VIRTUAL_DISPLAY_FLAG_DESTROY_CONTENT_ON_REMOVAL",
+            "VIRTUAL_DISPLAY_FLAG_SHOULD_SHOW_SYSTEM_DECORATIONS",
+            "VIRTUAL_DISPLAY_FLAG_TRUSTED",
+            "VIRTUAL_DISPLAY_FLAG_OWN_DISPLAY_GROUP",
+            "VIRTUAL_DISPLAY_FLAG_ALWAYS_UNLOCKED",
+            "VIRTUAL_DISPLAY_FLAG_TOUCH_FEEDBACK_DISABLED",
         )
     }
 
@@ -56,13 +58,13 @@ class SettingActivity : AppCompatActivity() {
             v.setPadding(systemBars.left, systemBars.top, systemBars.right, systemBars.bottom)
             insets
         }
-
         initData()
     }
 
     private fun initData() {
         binding?.apply {
             config = gson.fromJson(YAMFManagerProxy.configJson, YAMFConfig::class.java)
+            if (Build.VERSION.SDK_INT >= API_37) config.windowMode = 0
             applyConfigToViews()
 
             btnResetConfig.setOnClickListener {
@@ -71,27 +73,21 @@ class SettingActivity : AppCompatActivity() {
                     .setMessage(R.string.reset_config_message)
                     .setNegativeButton(R.string.cancel, null)
                     .setPositiveButton(R.string.reset) { _, _ ->
-                        config = YAMFConfig()
+                        config = YAMFConfig().also {
+                            if (Build.VERSION.SDK_INT >= API_37) it.windowMode = 0
+                        }
                         preference.edit().putBoolean("useAppList", true).apply()
                         applyConfigToViews()
                         YAMFManagerProxy.updateConfig(gson.toJson(config))
                     }
                     .show()
             }
-
             btnFlags.setOnClickListener {
-                val checks = BooleanArray(flags.size) { i ->
-                    config.flags and (1 shl i) != 0
-                }
+                val checks = BooleanArray(flags.size) { i -> config.flags and (1 shl i) != 0 }
                 MaterialAlertDialogBuilder(this@SettingActivity)
                     .setMultiChoiceItems(flags.toTypedArray(), checks) { _, i, c ->
                         checks[i] = c
-                        btnFlags.text = checks.foldIndexed(0) { i, f, b ->
-                            if (b)
-                                f + (1 shl i)
-                            else
-                                f
-                        }.toString()
+                        btnFlags.text = checks.foldIndexed(0) { i, f, b -> if (b) f + (1 shl i) else f }.toString()
                     }
                     .setPositiveButton("about") { _, _ ->
                         startActivity(Intent(Intent.ACTION_VIEW).apply {
@@ -112,7 +108,7 @@ class SettingActivity : AppCompatActivity() {
             }
             btnSurface.setOnClickListener {
                 PopupMenu(this@SettingActivity, btnSurface).apply {
-                    listOf("Texture View", "Surface View").forEach { i ->
+                    listOf("Surface View", "Texture View").forEach { i ->
                         menu.add(i).setOnMenuItemClickListener {
                             btnSurface.text = i
                             true
@@ -120,21 +116,28 @@ class SettingActivity : AppCompatActivity() {
                     }
                 }.show()
             }
-            btnWindowMode.setOnClickListener {
-                PopupMenu(this@SettingActivity, btnWindowMode).apply {
-                    val modes = listOf(getString(R.string.window_mode_vd), getString(R.string.window_mode_freeform))
-                    modes.forEachIndexed { index, i ->
-                        menu.add(i).setOnMenuItemClickListener {
-                            btnWindowMode.text = i
-                            config.windowMode = index
-                            true
+
+            if (Build.VERSION.SDK_INT >= API_37) {
+                btnWindowMode.isEnabled = false
+                btnWindowMode.alpha = 0.65f
+                config.windowMode = 0
+            } else {
+                btnWindowMode.setOnClickListener {
+                    PopupMenu(this@SettingActivity, btnWindowMode).apply {
+                        val modes = listOf(getString(R.string.window_mode_vd), getString(R.string.window_mode_freeform))
+                        modes.forEachIndexed { index, i ->
+                            menu.add(i).setOnMenuItemClickListener {
+                                btnWindowMode.text = i
+                                config.windowMode = index
+                                true
+                            }
                         }
-                    }
-                }.show()
+                    }.show()
+                }
             }
+
             sliderRounded.addOnSliderTouchListener(object : Slider.OnSliderTouchListener {
                 override fun onStartTrackingTouch(slider: Slider) {}
-
                 override fun onStopTrackingTouch(slider: Slider) {
                     tvRoundedValue.text = "${slider.value.toInt()}"
                     config.windowRoundedCorner = slider.value.toInt()
@@ -144,13 +147,8 @@ class SettingActivity : AppCompatActivity() {
 
             sliderAnimationSpeed.addOnSliderTouchListener(object : Slider.OnSliderTouchListener {
                 override fun onStartTrackingTouch(slider: Slider) {}
-
                 override fun onStopTrackingTouch(slider: Slider) {
-                    tvAnimationSpeedValue.text = if (slider.value == 5100f){
-                        getString(R.string.default_speed)
-                    } else{
-                        "${slider.value.toInt()}"
-                    }
+                    tvAnimationSpeedValue.text = if (slider.value == 5100f) getString(R.string.default_speed) else "${slider.value.toInt()}"
                     config.animationSpeed = slider.value
                     YAMFManagerProxy.updateConfig(gson.toJson(config))
                 }
@@ -160,6 +158,7 @@ class SettingActivity : AppCompatActivity() {
 
     private fun applyConfigToViews() {
         binding?.apply {
+            if (Build.VERSION.SDK_INT >= API_37) config.windowMode = 0
             etReduceDPI.setText(config.reduceDPI.toString())
             btnFlags.text = config.flags.toString()
             sColoerd.isChecked = config.coloredController
@@ -177,32 +176,26 @@ class SettingActivity : AppCompatActivity() {
             sliderRounded.value = config.windowRoundedCorner.toFloat()
             sliderAnimationSpeed.value = config.animationSpeed
             tvRoundedValue.text = "${config.windowRoundedCorner}"
-            tvAnimationSpeedValue.text = if (config.animationSpeed == 5100f) {
-                getString(R.string.default_speed)
-            } else {
-                "${config.animationSpeed.toFloat()}"
-            }
+            tvAnimationSpeedValue.text = if (config.animationSpeed == 5100f) getString(R.string.default_speed) else "${config.animationSpeed.toFloat()}"
             btnSurface.text = when (config.surfaceView) {
-                0 -> "Texture View"
-                1 -> "Surface View"
-                else -> {
-                    Log.d("reYAMF", "surfaceView: ${config.surfaceView}")
-                    "Unavailable"
-                }
-            }
-            btnWindowMode.text = when (config.windowMode) {
-                0 -> getString(R.string.window_mode_vd)
-                1 -> getString(R.string.window_mode_freeform)
+                0 -> "Surface View"
+                1 -> "Texture View"
                 else -> "Unavailable"
+            }
+            btnWindowMode.text = if (Build.VERSION.SDK_INT >= API_37) {
+                "${getString(R.string.window_mode_vd)} (API 37 Safe)"
+            } else {
+                when (config.windowMode) {
+                    0 -> getString(R.string.window_mode_vd)
+                    1 -> getString(R.string.window_mode_freeform)
+                    else -> "Unavailable"
+                }
             }
             btnWindowsfy.text = when (config.windowfy) {
                 0 -> "Move Task"
                 1 -> "Start Activity"
                 2 -> "Hybrid"
-                else -> {
-                    Log.d("reYAMF", "windowfy: ${config.windowfy}")
-                    "Unavailable"
-                }
+                else -> "Unavailable"
             }
         }
     }
@@ -212,34 +205,18 @@ class SettingActivity : AppCompatActivity() {
         binding?.apply {
             config.reduceDPI = etReduceDPI.text.toString().toIntOrNull() ?: config.reduceDPI
             config.flags = btnFlags.text.toString().toIntOrNull() ?: config.flags
-            config.surfaceView = when (val surface = btnSurface.text.toString()) {
-                "Texture View" -> {
-                    0
-                }
-                "Surface View" -> {
-                    1
-                }
-                else -> {
-                    Log.d("YAMF", "surface value: $surface")
-                    0
-                }
+            config.surfaceView = when (btnSurface.text.toString()) {
+                "Surface View" -> 0
+                "Texture View" -> 1
+                else -> 0
             }
-
-            config.windowfy = when (val window = btnWindowsfy.text.toString()) {
-                "Move Task" -> {
-                    0
-                }
-                "Start Activity" -> {
-                    1
-                }
-                "Hybrid" -> {
-                    2
-                }
-                else -> {
-                    Log.d("reYAMF", "window value: $window")
-                    0
-                }
+            config.windowfy = when (btnWindowsfy.text.toString()) {
+                "Move Task" -> 0
+                "Start Activity" -> 1
+                "Hybrid" -> 2
+                else -> 0
             }
+            config.windowMode = if (Build.VERSION.SDK_INT >= API_37) 0 else config.windowMode
             config.coloredController = sColoerd.isChecked
             config.recentBackHome = sBackHome.isChecked
             config.showImeInWindow = sShowIMEinWindow.isChecked
