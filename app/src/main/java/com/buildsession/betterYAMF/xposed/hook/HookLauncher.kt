@@ -87,6 +87,9 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
     private var mDropZoneView: WindowDropZoneView? = null
     private var mDropZoneWindowManager: WindowManager? = null
     private var nativeAvailable = false
+    // Rotation may restore Quickstep's cached Overview state after the normal
+    // configuration callback. Keep a short-lived cleanup flag for that window.
+    @Volatile private var mRotationCleanupPending = false
     private var gestureWindowWidth = 280
     private var gestureWindowHeight = 380
     private val nativeTransition = QuickstepWindowTransition { taskId ->
@@ -262,6 +265,49 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
             }
         }
 
+        // Rotation is delivered as a Launcher configuration change. Quickstep
+        // can keep a cached Overview state through that transition, then redraw
+        // the full task carousel behind the floating window. Drop the stale
+        // gesture and restore NORMAL for the duration of the rotation settle.
+        runCatching {
+            val launcherClass = XposedHelpers.findClass("com.android.launcher3.Launcher", lpparam.classLoader)
+            XposedBridge.hookAllMethods(launcherClass, "onHandleConfigurationChanged", object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    mRotationCleanupPending = true
+                    nativeTransition.abort()
+                    resetGestureTracking(removeZone = true)
+                }
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val launcher = param.thisObject
+                    log(TAG, "Launcher configuration changed; resetting Quickstep state")
+                    forceLauncherNormal(launcher)
+                    // The platform rotation transition can re-apply its cached
+                    // Overview state near the end of the ~700 ms display change.
+                    mMainHandler.postDelayed({ forceLauncherNormal(launcher) }, 140L)
+                    mMainHandler.postDelayed({
+                        forceLauncherNormal(launcher)
+                        mRotationCleanupPending = false
+                    }, 760L)
+                }
+            })
+            // Some Launcher3 builds dispatch rotation through Activity.onResume
+            // without invoking the override above.  Re-apply NORMAL there too;
+            // the guard keeps ordinary app launches and recents unaffected.
+            XposedBridge.hookAllMethods(launcherClass, "onResume", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val launcher = param.thisObject
+                    if (!mRotationCleanupPending) return
+                    log(TAG, "Launcher resumed during rotation; restoring NORMAL")
+                    forceLauncherNormal(launcher)
+                    mMainHandler.postDelayed({
+                        if (mRotationCleanupPending) forceLauncherNormal(launcher)
+                    }, 180L)
+                    mMainHandler.postDelayed({
+                        if (mRotationCleanupPending) forceLauncherNormal(launcher)
+                    }, 900L)
+                }
+            })
+        }.onFailure { log(TAG, "Unable to hook Launcher configuration changes", it) }
         findMethod("com.android.launcher3.Launcher") {
             name == "onCreate"
         }.hookAfter {
@@ -298,6 +344,24 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 isRegistered = true
             }
         }
+    }
+
+    private fun forceLauncherNormal(launcher: Any) {
+        runCatching {
+            val manager = runCatching { XposedHelpers.callMethod(launcher, "getStateManager") }
+                .getOrElse { XposedHelpers.getObjectField(launcher, "mStateManager") }
+            val state = XposedHelpers.findClass(
+                "com.android.launcher3.LauncherState", launcher.javaClass.classLoader
+            )
+            XposedHelpers.callMethod(manager, "goToState",
+                XposedHelpers.getStaticObjectField(state, "NORMAL"), false)
+        }.onFailure { log(TAG, "Unable to restore Launcher normal state after rotation", it) }
+        // AOSP/Quickstep may keep the RecentsView visible while a rotation
+        // transition is settling.  Dispatching the same back action as the
+        // stock system gesture clears that visual state even when goToState()
+        // only updated the target state asynchronously.
+        runCatching { XposedHelpers.callMethod(launcher, "onBackPressed") }
+            .onFailure { log(TAG, "Unable to dismiss Launcher overview after rotation", it) }
     }
 
     private fun hookRecent(lpparam: XC_LoadPackage.LoadPackageParam) {
