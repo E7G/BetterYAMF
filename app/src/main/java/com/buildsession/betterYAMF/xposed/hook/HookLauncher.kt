@@ -430,6 +430,11 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
             if (mDropZoneView != null) return@post
             val wm = context.getSystemService(android.content.Context.WINDOW_SERVICE) as WindowManager
             val view = WindowDropZoneView(context)
+            view.alpha = 0f
+            view.scaleX = .78f
+            view.scaleY = .78f
+            view.pivotX = mDropZoneRect.width().toFloat()
+            view.pivotY = 0f
             val lp = WindowManager.LayoutParams().apply {
                 type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
                 format = PixelFormat.TRANSLUCENT
@@ -443,6 +448,10 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
             runCatching { wm.addView(view, lp) }.onSuccess {
                 mDropZoneView = view
                 mDropZoneWindowManager = wm
+                view.animate().alpha(1f).scaleX(1f).scaleY(1f)
+                    .setDuration(180L)
+                    .setInterpolator(android.view.animation.PathInterpolator(.16f, .84f, .24f, 1f))
+                    .start()
             }.onFailure { log(TAG, "Unable to show window drop zone", it) }
         }
     }

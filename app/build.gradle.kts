@@ -11,7 +11,7 @@ plugins {
 
 android {
     val buildTime = System.currentTimeMillis()
-    val baseVersionName = "Preview1.2-perf6"
+    val baseVersionName = "Preview1.2-perf7"
     namespace = "com.buildsession.betterYAMF"
     compileSdk = 36
 
@@ -19,7 +19,7 @@ android {
         applicationId = "com.buildsession.betterYAMF"
         minSdk = 33
         targetSdk = 36
-        versionCode = 10
+        versionCode = 11
         versionName = baseVersionName
 
         ndk {

@@ -37,6 +37,7 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
         var commit = false
         var claimed = false
         var ending = false
+        var visualProgress = 0f
         var animator: ValueAnimator? = null
         var framePending = false
         val rect = RectF(0f, 0f, width.toFloat(), height.toFloat())
@@ -139,7 +140,14 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
             s.rect.set(s.claimStart)
             s.claimed = true
         }
-        val p = ((progress - .12f) / .50f).coerceIn(0f, 1f)
+        // Let the live task follow both axes. A paused horizontal steer must continue
+        // the same transformation instead of waiting for another vertical swipe.
+        val verticalP = ((progress - .12f) / .50f).coerceIn(0f, 1f)
+        val horizontalP = ((dx / s.width - .055f) / .50f).coerceIn(0f, 1f)
+        val rawP = maxOf(verticalP, horizontalP)
+        // HyperOS uses a soft ease-out: no jump when claiming, then a quick settle.
+        val p = rawP * rawP * (3f - 2f * rawP)
+        s.visualProgress = p
         val w = s.claimStart.width() + (s.destination.width() - s.claimStart.width()) * p
         val h = s.claimStart.height() + (s.destination.height() - s.claimStart.height()) * p
         val left = s.claimStart.left + (s.destination.left - s.claimStart.left) * p
@@ -170,7 +178,8 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
                 s.recentsAlpha = recents.alpha
             }
             // Keep the launcher at app-state progress, suppress only its overview view.
-            recents?.alpha = 0f
+            val fadeP = (s.visualProgress / .30f).coerceIn(0f, 1f)
+            recents?.alpha = s.recentsAlpha * (1f - fadeP * fadeP * (3f - 2f * fadeP))
             val target = s.target ?: return
             val leash = XposedHelpers.getObjectField(target, "leash") as SurfaceControl
             if (!leash.isValid) return
@@ -189,7 +198,7 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
             XposedHelpers.callMethod(s.transaction, "setMatrix", leash, s.matrix, s.matrixValues)
             XposedHelpers.callMethod(s.transaction, "setWindowCrop", leash, s.crop)
             XposedHelpers.callMethod(s.transaction, "setCornerRadius", leash,
-                22 * s.density * (1f - scale) / scale.coerceAtLeast(.1f))
+                22 * s.density)
             s.transaction.setAlpha(leash, 1f).apply()
         }.onFailure {
             log(HookLauncher.TAG, "Native transition failed; restore app", it)
@@ -215,7 +224,7 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
         val to = if (s.commit) s.destination else RectF(0f, 0f, s.width.toFloat(), s.height.toFloat())
         s.animator = ValueAnimator.ofFloat(0f, 1f).apply {
             duration = if (s.commit) 240 else 180
-            interpolator = PathInterpolator(.2f, 0f, 0f, 1f)
+            interpolator = PathInterpolator(.16f, .84f, .24f, 1f)
             addUpdateListener {
                 val p = it.animatedValue as Float
                 s.rect.set(from.left + (to.left - from.left) * p, from.top + (to.top - from.top) * p,
