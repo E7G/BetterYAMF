@@ -218,7 +218,7 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                             val upward = mStartY - correctedY
                             val progress = (upward / (mScreenHeight * .60f)).coerceIn(0f, 1f)
                             val paused = nativeTransition.isMotionPaused()
-                            if (paused && progress >= .10f) showDropZone(context)
+                            if (paused && progress >= .08f) showDropZone(context)
                             nativeTransition.update(
                                 progress,
                                 correctedX - mStartX,

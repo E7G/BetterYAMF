@@ -144,24 +144,29 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
         if (s.ending) return
         if (!s.claimed) {
             if (!allowClaim) return
-            if (progress < .12f || dx < s.width * .055f) return
+            // Claim as soon as the paused gesture has a clear rightward
+            // intention. Waiting for the recents card to fully settle makes
+            // the handoff visibly jump from the centre of the screen.
+            if (progress < .08f || dx < s.width * .025f) return
             readSystemRect(s)?.let(s.claimStart::set)
             s.rect.set(s.claimStart)
             s.claimed = true
         }
         // Let the live task follow both axes. A paused horizontal steer must continue
         // the same transformation instead of waiting for another vertical swipe.
-        val verticalP = ((progress - .12f) / .50f).coerceIn(0f, 1f)
-        val horizontalP = ((dx / s.width - .055f) / .50f).coerceIn(0f, 1f)
-        // Keep the leash close to the user's finger during the approach. The
-        // corner destination only starts pulling once proximity reports that
-        // the pointer is inside the target's attraction band.
-        val approachP = minOf(.14f, maxOf(verticalP * .22f, horizontalP * .10f))
+        val verticalP = ((progress - .08f) / .62f).coerceIn(0f, 1f)
+        val horizontalP = ((dx / s.width - .025f) / .42f).coerceIn(0f, 1f)
+        // HyperOS treats this as one continuous route: the upward motion
+        // prepares the handoff, then rightward steering progressively hands
+        // control to the corner. This avoids the old centre -> corner jump.
+        val lateralEase = horizontalP * horizontalP * (3f - 2f * horizontalP)
+        val routeP = (verticalP * (.08f + .78f * lateralEase) + horizontalP * .14f)
+            .coerceIn(0f, .84f)
         val near = proximity.coerceIn(0f, 1f)
         // Smootherstep gives zero velocity at both ends of the magnetic band,
         // matching the soft "glide then dock" feel of HyperOS.
         val magneticP = near * near * near * (near * (near * 6f - 15f) + 10f)
-        s.desiredProgress = maxOf(approachP, magneticP)
+        s.desiredProgress = maxOf(routeP, magneticP)
         advanceVisualProgress(s)
         updateRect(s)
         scheduleApply(s)
@@ -300,7 +305,6 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
                     val state = XposedHelpers.findClass("com.android.launcher3.LauncherState", handler.javaClass.classLoader)
                     XposedHelpers.callMethod(manager, "goToState", XposedHelpers.getStaticObjectField(state, "NORMAL"), false)
                 }
-                if (commit) onCommit(s.taskId)
             }
             if (controller != null) finishController(controller, commit, done)
             else done.run()

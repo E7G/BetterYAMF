@@ -702,8 +702,18 @@ class AppWindow(
             this.width = width
             this.height = height
         }
-        onVirtualDisplayCreated(this, displayId)
-        updateFocusedDisplay(YAMFManager.currentDisplayId)
+        // During the gesture handoff the task is moved to the virtual display by
+        // onVirtualDisplayCreated().  Do not move it while cvParent is still
+        // invisible: SurfaceFlinger would briefly expose the task's bootstrap
+        // surface (a black/loading card) before the floating window is laid out.
+        // The resulting frame looked like a second animation from the centre to
+        // the corner.  Non-gesture launches retain the original ordering so the
+        // normal scale-in animation is not delayed.
+        val fromGesture = startCmd?.fromGesture == true
+        if (!fromGesture) {
+            onVirtualDisplayCreated(this, displayId)
+            updateFocusedDisplay(YAMFManager.currentDisplayId)
+        }
 
         isResize = false
         binding.cvBackground.post {
@@ -722,7 +732,7 @@ class AppWindow(
             originalHeight = binding.cvParent.height
             binding.cvParent.visibility = View.VISIBLE
 
-            if (startCmd?.fromGesture == true) {
+            if (fromGesture) {
                 setBackgroundWrapContent()
                 binding.cvBackground.scaleX = 1f
                 binding.cvBackground.scaleY = 1f
@@ -748,6 +758,14 @@ class AppWindow(
 
                     isResize = true
                 }
+            }
+
+            if (fromGesture) {
+                // The window is now measured, visible and already positioned at
+                // the final corner.  Only now hand the task to the virtual
+                // display, keeping the compositor handoff under this surface.
+                onVirtualDisplayCreated(this@AppWindow, displayId)
+                updateFocusedDisplay(YAMFManager.currentDisplayId)
             }
         }
 
