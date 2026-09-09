@@ -16,6 +16,8 @@ import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import com.buildsession.betterYAMF.xposed.utils.log
+import kotlin.math.abs
+import kotlin.math.exp
 
 /** Uses Quickstep's existing remote-animation leash, never a task screenshot or an overlay.
  * Only a stream explicitly claimed by HookLauncher may change the stock handler's behavior.
@@ -38,6 +40,8 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
         var claimed = false
         var ending = false
         var visualProgress = 0f
+        var desiredProgress = 0f
+        var lastProgressNanos = 0L
         var animator: ValueAnimator? = null
         var framePending = false
         val rect = RectF(0f, 0f, width.toFloat(), height.toFloat())
@@ -149,19 +153,17 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
         // the same transformation instead of waiting for another vertical swipe.
         val verticalP = ((progress - .12f) / .50f).coerceIn(0f, 1f)
         val horizontalP = ((dx / s.width - .055f) / .50f).coerceIn(0f, 1f)
-        // Keep the leash close to the user's finger during the approach.  The
+        // Keep the leash close to the user's finger during the approach. The
         // corner destination only starts pulling once proximity reports that
         // the pointer is inside the target's attraction band.
-        val approachP = minOf(.16f, maxOf(verticalP * .25f, horizontalP * .12f))
+        val approachP = minOf(.14f, maxOf(verticalP * .22f, horizontalP * .10f))
         val near = proximity.coerceIn(0f, 1f)
-        val magneticP = near * near * (3f - 2f * near)
-        val p = maxOf(approachP, magneticP)
-        s.visualProgress = p
-        val w = s.claimStart.width() + (s.destination.width() - s.claimStart.width()) * p
-        val h = s.claimStart.height() + (s.destination.height() - s.claimStart.height()) * p
-        val left = s.claimStart.left + (s.destination.left - s.claimStart.left) * p
-        val top = s.claimStart.top + (s.destination.top - s.claimStart.top) * p
-        s.rect.set(left, top, left + w, top + h)
+        // Smootherstep gives zero velocity at both ends of the magnetic band,
+        // matching the soft "glide then dock" feel of HyperOS.
+        val magneticP = near * near * near * (near * (near * 6f - 15f) + 10f)
+        s.desiredProgress = maxOf(approachP, magneticP)
+        advanceVisualProgress(s)
+        updateRect(s)
         scheduleApply(s)
     }
 
@@ -174,8 +176,43 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
         s.framePending = true
         Choreographer.getInstance().postFrameCallback {
             s.framePending = false
-            if (session === s) apply(s)
+            if (session === s) {
+                if (!s.ending && s.claimed) {
+                    val moving = advanceVisualProgress(s)
+                    updateRect(s)
+                    apply(s)
+                    if (moving) scheduleApply(s)
+                } else {
+                    apply(s)
+                }
+            }
         }
+    }
+
+    /** Critically-damped handoff: no discontinuity when magnetic target engages. */
+    private fun advanceVisualProgress(s: Session): Boolean {
+        val now = System.nanoTime()
+        val dtMs = if (s.lastProgressNanos == 0L) 16f
+        else ((now - s.lastProgressNanos) / 1_000_000f).coerceIn(1f, 32f)
+        s.lastProgressNanos = now
+        val delta = s.desiredProgress - s.visualProgress
+        if (abs(delta) < .001f) {
+            s.visualProgress = s.desiredProgress
+            return false
+        }
+        val responseMs = if (delta > 0f) 145f else 95f
+        val blend = 1f - exp(-dtMs / responseMs)
+        s.visualProgress += delta * blend
+        return true
+    }
+
+    private fun updateRect(s: Session) {
+        val p = s.visualProgress.coerceIn(0f, 1f)
+        val w = s.claimStart.width() + (s.destination.width() - s.claimStart.width()) * p
+        val h = s.claimStart.height() + (s.destination.height() - s.claimStart.height()) * p
+        val left = s.claimStart.left + (s.destination.left - s.claimStart.left) * p
+        val top = s.claimStart.top + (s.destination.top - s.claimStart.top) * p
+        s.rect.set(left, top, left + w, top + h)
     }
 
     private fun apply(s: Session) {
@@ -232,8 +269,8 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
         val from = RectF(s.rect)
         val to = if (s.commit) s.destination else RectF(0f, 0f, s.width.toFloat(), s.height.toFloat())
         s.animator = ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = if (s.commit) 320 else 220
-            interpolator = PathInterpolator(.20f, .75f, .30f, 1f)
+            duration = if (s.commit) 180 else 140
+            interpolator = PathInterpolator(.22f, .80f, .30f, 1f)
             addUpdateListener {
                 val p = it.animatedValue as Float
                 s.rect.set(from.left + (to.left - from.left) * p, from.top + (to.top - from.top) * p,
