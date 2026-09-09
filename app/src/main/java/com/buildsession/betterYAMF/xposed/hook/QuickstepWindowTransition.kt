@@ -92,15 +92,6 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
                     val s = owned(param) ?: return
                     if (method == "onGestureCancelled" || !s.commit) {
                         restoreSystemGesture(s)
-                        if (method == "onGestureEnded") {
-                            // Once target UI appeared this gesture has exactly two outcomes:
-                            // drop into window, or settle on Overview (never also go Home).
-                            if (param.args.isNotEmpty() && param.args[0] is Float) param.args[0] = 0f
-                            if (param.args.size > 1 && param.args[1] is android.graphics.PointF) {
-                                param.args[1] = android.graphics.PointF()
-                            }
-                            XposedHelpers.setBooleanField(param.thisObject, "mIsMotionPaused", true)
-                        }
                         return
                     }
                     s.ending = true
@@ -132,10 +123,17 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
         main.postDelayed({ if (session === s && s.controller == null) release(s) }, 1500)
     }
 
-    fun update(progress: Float, dx: Float) {
+    fun isMotionPaused(): Boolean {
+        val handler = session?.handler ?: return false
+        return runCatching { XposedHelpers.getBooleanField(handler, "mIsMotionPaused") }
+            .getOrDefault(false)
+    }
+
+    fun update(progress: Float, dx: Float, allowClaim: Boolean) {
         val s = session ?: return
         if (s.ending) return
         if (!s.claimed) {
+            if (!allowClaim) return
             if (progress < .12f || dx < s.width * .055f) return
             readSystemRect(s)?.let(s.claimStart::set)
             s.rect.set(s.claimStart)

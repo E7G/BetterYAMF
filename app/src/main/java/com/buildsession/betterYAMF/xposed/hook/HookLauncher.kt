@@ -57,6 +57,7 @@ import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.lang.reflect.Proxy
+import kotlin.math.min
 
 
 class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
@@ -133,13 +134,10 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
             mScreenHeight = newHeight
             
             // 横屏下让释放区更宽一些，竖屏下保持原
-            // Keep the compact, top-right hot area used by the original project.
-            val zoneWidthPercent = if (mScreenWidth > mScreenHeight) 0.50 else 0.60
-            val zoneHeightPercent = if (mScreenWidth > mScreenHeight) 0.40 else 0.30
-            
-            val zoneWidth = (mScreenWidth * zoneWidthPercent).toInt()
-            val zoneHeight = (mScreenHeight * zoneHeightPercent).toInt()
-            mDropZoneRect.set(mScreenWidth - zoneWidth, 0, mScreenWidth, zoneHeight)
+            // HyperOS-style compact quarter circle anchored to the upper-right corner.
+            val zoneSize = (96 * context.resources.displayMetrics.density).toInt()
+                .coerceAtMost((min(mScreenWidth, mScreenHeight) * .28f).toInt())
+            mDropZoneRect.set(mScreenWidth - zoneSize, 0, mScreenWidth, zoneSize)
             
         }
     }
@@ -218,14 +216,15 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         MotionEvent.ACTION_MOVE -> if (mIsPotentialSwipeUp) {
                             val upward = mStartY - correctedY
                             val progress = (upward / (mScreenHeight * .60f)).coerceIn(0f, 1f)
-                            if (progress >= .10f) showDropZone(context)
-                            nativeTransition.update(progress, correctedX - mStartX)
-                            updateDropZone(nativeTransition.claimed && mDropZoneRect.contains(
-                                correctedX.toInt(), correctedY.toInt()))
+                            val paused = nativeTransition.isMotionPaused()
+                            if (paused && progress >= .10f) showDropZone(context)
+                            nativeTransition.update(progress, correctedX - mStartX, paused)
+                            updateDropZone(nativeTransition.claimed &&
+                                isInDropZone(correctedX, correctedY))
                         }
                         MotionEvent.ACTION_UP -> if (mIsPotentialSwipeUp) {
-                            nativeTransition.setCommit(nativeTransition.claimed && mDropZoneRect.contains(
-                                correctedX.toInt(), correctedY.toInt()))
+                            nativeTransition.setCommit(nativeTransition.claimed &&
+                                isInDropZone(correctedX, correctedY))
                             hideDropZone()
                             resetGestureTracking(false)
                         }
@@ -450,6 +449,13 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
     private fun updateDropZone(highlighted: Boolean) {
         mMainHandler.post { mDropZoneView?.highlighted = highlighted }
+    }
+
+    private fun isInDropZone(x: Float, y: Float): Boolean {
+        if (!mDropZoneRect.contains(x.toInt(), y.toInt())) return false
+        val dx = mScreenWidth - x
+        val radius = mDropZoneRect.width().toFloat()
+        return dx * dx + y * y <= radius * radius
     }
 
     private fun hideDropZone() {
