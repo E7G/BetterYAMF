@@ -324,6 +324,7 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
                     val state = XposedHelpers.findClass("com.android.launcher3.LauncherState", handler.javaClass.classLoader)
                     XposedHelpers.callMethod(manager, "goToState", XposedHelpers.getStaticObjectField(state, "NORMAL"), false)
                 }
+                if (commit) onCommit(s.taskId)
             }
             if (controller != null) finishController(controller, commit, done)
             else done.run()
