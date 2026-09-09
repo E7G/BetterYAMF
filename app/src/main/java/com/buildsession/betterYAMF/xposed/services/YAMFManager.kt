@@ -71,6 +71,7 @@ object YAMFManager : IYAMFManager.Stub() {
     const val SOURCE_RECENT = 1
     const val SOURCE_TASKBAR = 2
     const val SOURCE_POPUP = 3
+    const val SOURCE_GESTURE = 4
 
     val windowList = mutableListOf<Int>()
     private val activeWindows = mutableMapOf<Int, AppWindow>()
@@ -162,6 +163,8 @@ object YAMFManager : IYAMFManager.Stub() {
             ActivityManagerApis.broadcastIntent(Intent(HookLauncher.ACTION_RECEIVE_LAUNCHER_CONFIG).apply {
                 // log(TAG, "send config: ${config.hookLauncher}")
                 putExtra(HookLauncher.EXTRA_HOOK_RECENT, config.hookLauncher.hookRecents)
+                putExtra(HookLauncher.EXTRA_WINDOW_WIDTH, config.defaultWindowWidth)
+                putExtra(HookLauncher.EXTRA_WINDOW_HEIGHT, config.defaultWindowHeight)
                 putExtra(HookLauncher.EXTRA_HOOK_TASKBAR, config.hookLauncher.hookTaskbar)
                 putExtra(HookLauncher.EXTRA_HOOK_POPUP, config.hookLauncher.hookPopup)
                 putExtra(HookLauncher.EXTRA_HOOK_TRANSIENT_TASKBAR, config.hookLauncher.hookTransientTaskbar)
@@ -221,9 +224,13 @@ object YAMFManager : IYAMFManager.Stub() {
     }
 
     fun onFocusedDisplayChanged(displayId: Int) {
-        if (currentDisplayId == displayId) return
-        currentDisplayId = displayId
-        activeWindows.values.toList().forEach { it.updateFocusedDisplay(displayId) }
+        // InputMonitor calls from android.anim under WM's lock. Never touch Views there.
+        runMain {
+            if (currentDisplayId != displayId) {
+                currentDisplayId = displayId
+                activeWindows.values.toList().forEach { it.updateFocusedDisplay(displayId) }
+            }
+        }
     }
 
     fun isTop(id: Int) = if (windowList.isNotEmpty()) windowList[0] == id else true
@@ -507,7 +514,7 @@ object YAMFManager : IYAMFManager.Stub() {
                 intent.getParcelableExtra(EXTRA_COMPONENT_NAME, ComponentName::class.java)
             val userId = intent.getIntExtra(EXTRA_USER_ID, 0)
             val source = intent.getIntExtra(EXTRA_SOURCE, SOURCE_UNSPECIFIED)
-            createWindow(StartCmd(componentName, userId, taskId))
+            createWindow(StartCmd(componentName, userId, taskId, source == SOURCE_GESTURE))
 
             // TODO: better way to close recents
             if (source == SOURCE_RECENT && config.recentBackHome) {

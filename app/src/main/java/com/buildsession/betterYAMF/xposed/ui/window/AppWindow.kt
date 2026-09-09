@@ -219,6 +219,24 @@ class AppWindow(
             }
         }
 
+        // SurfaceView owns a separate compositor layer; the CardView's radius alone
+        // cannot clip it. Extend the outline above the content to round only the bottom.
+        surfaceView.outlineProvider = object : android.view.ViewOutlineProvider() {
+            override fun getOutline(view: View, outline: android.graphics.Outline) {
+                val radius = config.windowRoundedCorner.dpToPx()
+                outline.setRoundRect(0, -radius.toInt(), view.width, view.height, radius)
+            }
+        }
+        surfaceView.clipToOutline = true
+        surfaceView.addOnLayoutChangeListener { view, _, _, _, _, _, _, _, _ -> view.invalidateOutline() }
+        (surfaceView as? SurfaceView)?.let { view ->
+            // SurfaceView also punches a hole in its parent. Its native radius must
+            // match the UI radius, otherwise that hole stays rectangular.
+            runCatching {
+                view.invokeMethod("setCornerRadius", args(config.windowRoundedCorner.dpToPx()), argTypes(Float::class.javaPrimitiveType!!))
+            }.onFailure { Log.w(TAG, "Surface corner radius unavailable", it) }
+        }
+
         // Show the correct icon immediately. Waiting for a task-stack callback left the
         // collapsed bubble blank or displaying a previous task's icon.
         startCmd?.componentName?.let { component ->
@@ -241,7 +259,7 @@ class AppWindow(
         val display = displayManager.getDisplay(Display.DEFAULT_DISPLAY)
         val rotation = display?.rotation ?: Surface.ROTATION_0
         
-        val dm = context.resources.displayMetrics
+        val dm = getRealScreenMetrics()
         val screenWidth = dm.widthPixels
         val screenHeight = dm.heightPixels
         val windowWidth = config.defaultWindowWidth.dpToPx().toInt()
@@ -270,7 +288,14 @@ class AppWindow(
                     y = 0
                 }
             }
+
+            if (startCmd?.fromGesture == true) {
+                val margin = 18.dpToPx().toInt()
+                x = (screenWidth - windowWidth - margin).coerceAtLeast(0)
+                y = 24.dpToPx().toInt().coerceAtMost((screenHeight - windowHeight).coerceAtLeast(0))
+            }
         }
+
 
         paramsBg = WindowManager.LayoutParams(
             20.dpToPx().toInt(),
@@ -692,6 +717,8 @@ class AppWindow(
             binding.cvBackground.visibility = View.VISIBLE
 
             binding.cvBackground.radius = config.windowRoundedCorner.dpToPx()
+            binding.cvBackground.clipToOutline = true
+            binding.cvParent.clipToOutline = true
             binding.cvappIcon.radius = config.windowRoundedCorner.dpToPx()
 
 
@@ -700,23 +727,32 @@ class AppWindow(
             originalHeight = binding.cvParent.height
             binding.cvParent.visibility = View.VISIBLE
 
-            animateScaleThenResize(
-                binding.cvBackground,
-                0F, 0F,
-                1F, 1F,
-                0.5F, 0.5F,
-                originalWidth, originalHeight,
-                context
-            ) {
+            if (startCmd?.fromGesture == true) {
                 setBackgroundWrapContent()
-
-                mainScope.launch {
-                    delay(200)
-                    if (isDestroyed) return@launch
-                    binding.cvParent.strokeWidth = 2.dpToPx().toInt()
-                }
-
+                binding.cvBackground.scaleX = 1f
+                binding.cvBackground.scaleY = 1f
+                binding.root.alpha = 1f
+                binding.cvParent.strokeWidth = 1.dpToPx().toInt()
                 isResize = true
+            } else {
+                animateScaleThenResize(
+                    binding.cvBackground,
+                    0F, 0F,
+                    1F, 1F,
+                    0.5F, 0.5F,
+                    originalWidth, originalHeight,
+                    context
+                ) {
+                    setBackgroundWrapContent()
+
+                    mainScope.launch {
+                        delay(200)
+                        if (isDestroyed) return@launch
+                        binding.cvParent.strokeWidth = 1.dpToPx().toInt()
+                    }
+
+                    isResize = true
+                }
             }
         }
 
@@ -1122,14 +1158,13 @@ class AppWindow(
     private fun changeMini(targetCorner: Int? = null) {
         xFlingAnimation?.cancel()
         yFlingAnimation?.cancel()
+        cancelVirtualDisplayTouch()
         isCollapsed = false
         isResize = false
 
         if (isMini) {
             isMini = false
             isResize = true
-            binding.rootClickMask.visibility = View.GONE
-
             if (surfaceView is SurfaceView) {
                 binding.cvBackground.updateLayoutParams {
                     width = originalWidth
@@ -1172,9 +1207,7 @@ class AppWindow(
             } else {
                 binding.rlBarControllerSide.visibility = View.VISIBLE
             }
-            surfaceView.visibility = View.VISIBLE
-            surfaceView.setOnTouchListener(surfaceOnTouchListener)
-            surfaceView.setOnGenericMotionListener(surfaceOnGenericMotionListener)
+            restoreSurfaceInteraction()
 
             return
         }
@@ -1226,9 +1259,9 @@ class AppWindow(
     }
 
     private fun changeCollapsed() {
+        cancelVirtualDisplayTouch()
         isResize = false
         if (isCollapsed) {
-            binding.rootClickMask.visibility = View.GONE
             expandWindow()
             bindingLeftBackGesture.root.visibility = View.VISIBLE
             bindingRightBackGesture.root.visibility = View.VISIBLE
@@ -1245,7 +1278,7 @@ class AppWindow(
     private fun expandWindow() {
         isCollapsed = false
         binding.background.visibility = View.VISIBLE
-        binding.cvParent.setContentPadding(0, 0, 0, 15.dpToPx().toInt())
+        binding.cvParent.setContentPadding(0, 0, 0, 0)
 
         animateResizeCentered(
             binding.appIcon, 40.dpToPx().toInt(), 0, 40.dpToPx().toInt(), 0) {
@@ -1262,6 +1295,7 @@ class AppWindow(
                 binding.cvappIcon.visibility = View.GONE
                 isResize = true
                 keepInScreen()
+                restoreSurfaceInteraction()
             }
         }
     }
@@ -1411,6 +1445,46 @@ class AppWindow(
                 newEvent.recycle()
             }
         }
+    }
+
+    private fun cancelVirtualDisplayTouch() {
+        if (config.windowMode != 0 || displayId < 0) return
+        val now = SystemClock.uptimeMillis()
+        val cancel = MotionEvent.obtain(now, now, MotionEvent.ACTION_CANCEL, 0f, 0f, 0).apply {
+            source = InputDevice.SOURCE_TOUCHSCREEN
+        }
+        try {
+            val method = setInputDisplayId
+            val setDirectly = method != null && runCatching {
+                method.invoke(cancel, displayId)
+            }.isSuccess
+            if (!setDirectly) {
+                cancel.invokeMethod("setDisplayId", args(displayId), argTypes(Integer.TYPE))
+            }
+            Instances.inputManager.injectInputEvent(cancel, 0)
+        } catch (error: Throwable) {
+            Log.e(TAG, "Unable to cancel display input $displayId", error)
+        } finally {
+            cancel.recycle()
+        }
+    }
+
+    private fun restoreSurfaceInteraction() {
+        isSuperShown = false
+        binding.clSuperLayout.animate().cancel()
+        binding.clSuperLayout.visibility = View.GONE
+        binding.rootClickMask.visibility = View.GONE
+        surfaceView.visibility = View.VISIBLE
+        surfaceView.isEnabled = true
+        surfaceView.isClickable = true
+        surfaceView.setOnTouchListener(surfaceOnTouchListener)
+        surfaceView.setOnGenericMotionListener(surfaceOnGenericMotionListener)
+        (surfaceView as? SurfaceView)?.holder?.surface?.takeIf { it.isValid }?.let { surface ->
+            if (!isDestroyed && ::virtualDisplay.isInitialized) virtualDisplay.surface = surface
+        }
+        cancelVirtualDisplayTouch()
+        YAMFManager.moveToTop(displayId)
+        updateFocusedDisplay(displayId)
     }
 
     inner class SurfaceOnTouchListener : View.OnTouchListener {

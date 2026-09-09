@@ -9,26 +9,19 @@ import android.app.RemoteAction
 import android.content.ComponentName
 import android.content.Intent
 import android.content.res.Resources
-import android.graphics.Color
-import android.graphics.DashPathEffect
-import android.graphics.Paint
-import android.graphics.PixelFormat
 import android.graphics.Rect
-import android.graphics.RectF
-import android.graphics.drawable.ShapeDrawable
-import android.graphics.drawable.shapes.RoundRectShape
 import android.graphics.drawable.Icon
 import android.os.Handler
 import android.os.Build
 import android.os.Looper
 import android.os.UserHandle
-import android.view.Gravity
 import android.view.MotionEvent
+import android.view.Gravity
+import android.graphics.PixelFormat
 import android.view.View
 import android.view.WindowManager
 import android.view.ViewGroup
 import android.widget.ImageView
-import android.widget.TextView
 import androidx.core.graphics.drawable.toBitmap
 import com.github.kyuubiran.ezxhelper.init.EzXHelperInit
 import com.github.kyuubiran.ezxhelper.init.InitFields.moduleRes
@@ -76,21 +69,33 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
         const val EXTRA_HOOK_TASKBAR = "hookTaskbar"
         const val EXTRA_HOOK_POPUP = "hookPopup"
         const val EXTRA_HOOK_TRANSIENT_TASKBAR = "hookTransientTaskbar"
+        const val EXTRA_WINDOW_WIDTH = "gestureWindowWidth"
+        const val EXTRA_WINDOW_HEIGHT = "gestureWindowHeight"
     }
 
     private var isRegistered = false
 
-    private var mDropZoneView: View? = null
     private val mDropZoneRect = Rect()
     private val mMainHandler: Handler by lazy { Handler(Looper.getMainLooper()) }
     private var mScreenHeight = 0
     private var mScreenWidth = 0
     private var mStartX = 0f
     private var mStartY = 0f
-    private var mIsShowingZone = false
-    private var mIsYamfGesture = false
-    private var mSyntheticCancelEvent: MotionEvent? = null
     private var mCurrentTaskId = -1
+    private var mDropZoneView: WindowDropZoneView? = null
+    private var mDropZoneWindowManager: WindowManager? = null
+    private var nativeAvailable = false
+    private var gestureWindowWidth = 280
+    private var gestureWindowHeight = 380
+    private val nativeTransition = QuickstepWindowTransition { taskId ->
+        AndroidAppHelper.currentApplication().sendBroadcast(
+            Intent(YAMFManager.ACTION_OPEN_IN_YAMF).apply {
+                setPackage("android")
+                putExtra(YAMFManager.EXTRA_TASK_ID, taskId)
+                putExtra(YAMFManager.EXTRA_SOURCE, YAMFManager.SOURCE_GESTURE)
+            }
+        )
+    }
 
     private var mCurrentRotation = 0
     private var mIsAlreadyVisual = true
@@ -99,11 +104,19 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
     @Suppress("DEPRECATION")
     private fun captureTopTask(context: android.content.Context): Int {
         val activityManager = context.getSystemService(android.content.Context.ACTIVITY_SERVICE) as ActivityManager
-        return activityManager.getRunningTasks(10)
-            .firstOrNull { task ->
-                task.taskId > 0 && task.baseActivity?.packageName != context.packageName
-            }
-            ?.taskId ?: -1
+        val keyguard = context.getSystemService(android.app.KeyguardManager::class.java)
+        if (keyguard.isKeyguardLocked) return -1
+        val task = activityManager.getRunningTasks(1).firstOrNull() ?: return -1
+        if (XposedHelpers.getIntField(task, "displayId") != android.view.Display.DEFAULT_DISPLAY) return -1
+        val mode = runCatching { XposedHelpers.callMethod(task, "getWindowingMode") as Int }.getOrDefault(1)
+        if (mode != 1) return -1
+        val packageName = task.topActivity?.packageName ?: task.baseActivity?.packageName
+        if (task.taskId <= 0 || packageName == context.packageName ||
+            packageName == "com.android.launcher3" ||
+            packageName == "com.google.android.apps.nexuslauncher" ||
+            packageName?.contains("launcher", ignoreCase = true) == true
+        ) return -1
+        return task.taskId
     }
 
     private fun updateDimensions(context: android.content.Context) {
@@ -120,22 +133,13 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
             mScreenHeight = newHeight
             
             // 横屏下让释放区更宽一些，竖屏下保持原
-            val zoneWidthPercent = if (mScreenWidth > mScreenHeight) 0.36 else 0.42
-            val zoneHeightPercent = if (mScreenWidth > mScreenHeight) 0.48 else 0.34
+            val zoneWidthPercent = if (mScreenWidth > mScreenHeight) 0.34 else 0.47
+            val zoneHeightPercent = if (mScreenWidth > mScreenHeight) 0.68 else 0.46
             
             val zoneWidth = (mScreenWidth * zoneWidthPercent).toInt()
             val zoneHeight = (mScreenHeight * zoneHeightPercent).toInt()
             mDropZoneRect.set(mScreenWidth - zoneWidth, 0, mScreenWidth, zoneHeight)
             
-            mMainHandler.post {
-                mDropZoneView?.let { view ->
-                    val lp = view.layoutParams as? WindowManager.LayoutParams ?: return@post
-                    lp.width = zoneWidth
-                    lp.height = zoneHeight
-                    wm.updateViewLayout(view, lp)
-                }
-            }
-            // log(TAG, "Dimensions updated: ${mScreenWidth}x${mScreenHeight}, Zone: $mDropZoneRect")
         }
     }
 
@@ -159,64 +163,16 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
         // 尝试加载 TouchInteractionService，Pixel Launcher 可能会继承或直接使用该类
         val tisClass = loadClassOrNull("com.android.quickstep.TouchInteractionService")
         if (tisClass != null) {
-            // log(TAG, "Found TouchInteractionService in ${lpparam.packageName}")
-            findMethod(tisClass) { name == "onCreate" }.hookAfter { param ->
-                // log(TAG, "TouchInteractionService#onCreate hooked in ${lpparam.packageName}")
-                val context = param.thisObject as android.app.Service
-                
-                // 确保在主线程执行 UI 操作
-                mMainHandler.post {
-                    try {
-                        updateDimensions(context)
-                        val zoneWidth = mDropZoneRect.width()
-                        val zoneHeight = mDropZoneRect.height()
-
-                        if (mDropZoneView == null) {
-                            mDropZoneView = TextView(context).apply {
-                                visibility = View.GONE
-                                gravity = Gravity.CENTER
-                                text = "小窗"
-                                setTextColor(Color.WHITE)
-                                textSize = 16f
-                                setPadding(20, 20, 20, 20)
-                            }
-                            updateDropZoneColor(false)
-
-                            val lp = WindowManager.LayoutParams().apply {
-                                type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-                                format = PixelFormat.TRANSLUCENT
-                                flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-                                width = zoneWidth
-                                height = zoneHeight
-                                gravity = Gravity.TOP or Gravity.END
-                            }
-
-                            val windowManager =
-                                context.getSystemService(android.content.Context.WINDOW_SERVICE) as WindowManager
-                            windowManager.addView(mDropZoneView, lp)
-                            // log(TAG, "Successfully added mDropZoneView to WindowManager")
-                        }
-                    } catch (e: Exception) {
-                        log(TAG, "Error creating drop zone view", e)
-                    }
-                }
-            }
-
-            // 使用更通用的方式 Hook onInputEvent
+            nativeAvailable = nativeTransition.install(lpparam.classLoader)
             // Android 17 moved input dispatch out of TouchInteractionService.
             val inputOwnerClass = loadClassOrNull("com.android.quickstep.TouchInteractionHandler") ?: tisClass
             XposedBridge.hookAllMethods(inputOwnerClass, "onInputEvent", object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     val event = param.args[0] as? MotionEvent ?: return
                     val action = event.actionMasked
-                    if (action != MotionEvent.ACTION_DOWN &&
-                        action != MotionEvent.ACTION_MOVE &&
-                        action != MotionEvent.ACTION_UP &&
-                        action != MotionEvent.ACTION_CANCEL
-                    ) return
+                    if (action != MotionEvent.ACTION_DOWN && action != MotionEvent.ACTION_MOVE &&
+                        action != MotionEvent.ACTION_UP && action != MotionEvent.ACTION_CANCEL &&
+                        action != MotionEvent.ACTION_POINTER_DOWN) return
 
                     val context = AndroidAppHelper.currentApplication()
                     if (action == MotionEvent.ACTION_DOWN) {
@@ -225,153 +181,65 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         mCurrentRotation = wm.defaultDisplay.rotation
                         val rawX = event.rawX
                         val rawY = event.rawY
-                        // Newer Quickstep dispatches logical display coordinates in every rotation.
-                        mIsAlreadyVisual = Build.VERSION.SDK_INT >= 35 || if (mCurrentRotation == 0) {
-                            true
-                        } else if (mScreenWidth > mScreenHeight) {
-                            rawX > mScreenHeight + 100 || rawY > mScreenHeight + 100
-                        } else {
-                            rawX > mScreenWidth + 100 || rawY > mScreenWidth + 100
-                        }
+                        mIsAlreadyVisual = Build.VERSION.SDK_INT >= 35 || if (mCurrentRotation == 0) true
+                        else if (mScreenWidth > mScreenHeight) rawX > mScreenHeight + 100 || rawY > mScreenHeight + 100
+                        else rawX > mScreenWidth + 100 || rawY > mScreenWidth + 100
                     }
 
                     val rawX = event.rawX
                     val rawY = event.rawY
                     val correctedX: Float
                     val correctedY: Float
-                    if (mIsAlreadyVisual) {
-                        correctedX = rawX
-                        correctedY = rawY
-                    } else if (mCurrentRotation == 1) {
-                        correctedX = rawY
-                        correctedY = mScreenHeight.toFloat() - rawX
-                    } else if (mCurrentRotation == 3) {
-                        correctedX = mScreenWidth.toFloat() - rawY
-                        correctedY = rawX
-                    } else {
-                        correctedX = rawX
-                        correctedY = rawY
-                    }
-
-                    val isLandscape = mScreenWidth > mScreenHeight
-                    val isInZone = mDropZoneRect.contains(correctedX.toInt(), correctedY.toInt())
+                    if (mIsAlreadyVisual) { correctedX = rawX; correctedY = rawY }
+                    else if (mCurrentRotation == 1) { correctedX = rawY; correctedY = mScreenHeight - rawX }
+                    else if (mCurrentRotation == 3) { correctedX = mScreenWidth - rawY; correctedY = rawX }
+                    else { correctedX = rawX; correctedY = rawY }
 
                     when (action) {
                         MotionEvent.ACTION_DOWN -> {
+                            hideDropZone()
+                            nativeTransition.abort()
                             mStartX = correctedX
                             mStartY = correctedY
-                            mIsShowingZone = false
-                            mIsYamfGesture = false
                             mCurrentTaskId = runCatching { captureTopTask(context) }.getOrDefault(-1)
-                            val bottomEdgeRatio = if (isLandscape) 0.90f else 0.94f
-                            mIsPotentialSwipeUp = correctedY > mScreenHeight * bottomEdgeRatio
+                            val landscape = mScreenWidth > mScreenHeight
+                            mIsPotentialSwipeUp = nativeAvailable && mCurrentTaskId != -1 && event.pointerCount == 1 &&
+                                correctedY > mScreenHeight * if (landscape) .90f else .94f
+                            if (mIsPotentialSwipeUp) {
+                                val topInset = (context.getSystemService(android.content.Context.WINDOW_SERVICE) as WindowManager)
+                                    .currentWindowMetrics.windowInsets.getInsetsIgnoringVisibility(
+                                        android.view.WindowInsets.Type.statusBars()).top
+                                nativeTransition.begin(mCurrentTaskId, mScreenWidth, mScreenHeight,
+                                    context.resources.displayMetrics.density, gestureWindowWidth,
+                                    gestureWindowHeight, topInset)
+                            }
                         }
-
-                        MotionEvent.ACTION_MOVE -> {
-                            if (!mIsPotentialSwipeUp) return
-
-                            if (mIsYamfGesture) {
-                                updateDropZoneColor(isInZone)
-                                param.result = null
-                                return
-                            }
-
-                            val diffX = correctedX - mStartX
-                            val diffY = mStartY - correctedY
-                            val minX = mScreenWidth * if (isLandscape) 0.12f else 0.14f
-                            val minY = mScreenHeight * if (isLandscape) 0.16f else 0.15f
-                            val rightIntentX = mScreenWidth * if (isLandscape) 0.68f else 0.62f
-                            val isDiagonalToUpperRight = diffX > minX && diffY > minY &&
-                                    correctedX > rightIntentX
-                            if (!isDiagonalToUpperRight) return
-
-                            var capturedTaskId = mCurrentTaskId
-                            if (capturedTaskId == -1) runCatching {
-                                val gestureState = XposedHelpers.getObjectField(param.thisObject, "mGestureState")
-                                if (gestureState != null) {
-                                    val taskId = XposedHelpers.callMethod(gestureState, "getTopRunningTaskId") as Int
-                                    val runningTask = XposedHelpers.callMethod(gestureState, "getRunningTask")
-                                    val isHomeTask = runningTask != null &&
-                                            XposedHelpers.callMethod(runningTask, "isHomeTask") as Boolean
-                                    if (taskId != -1 && !isHomeTask) capturedTaskId = taskId
-                                }
-                            }
-                            if (capturedTaskId == -1) {
-                                mIsPotentialSwipeUp = false
-                                return
-                            }
-
-                            mCurrentTaskId = capturedTaskId
-                            mIsYamfGesture = true
-                            mIsShowingZone = true
-                            mMainHandler.post { mDropZoneView?.visibility = View.VISIBLE }
-                            updateDropZoneColor(isInZone)
-
-                            // Cancel Quickstep's in-progress overview gesture exactly once.
-                            // Later events are consumed, so overview and YAMF never both finish.
-                            mSyntheticCancelEvent = MotionEvent.obtain(event).also {
-                                it.setAction(MotionEvent.ACTION_CANCEL)
-                            }
-                            param.args[0] = mSyntheticCancelEvent
+                        MotionEvent.ACTION_MOVE -> if (mIsPotentialSwipeUp) {
+                            val upward = mStartY - correctedY
+                            val progress = (upward / (mScreenHeight * .60f)).coerceIn(0f, 1f)
+                            if (progress >= .10f) showDropZone(context)
+                            nativeTransition.update(progress, correctedX - mStartX)
+                            updateDropZone(nativeTransition.isFullyInside(mDropZoneRect))
                         }
-
-                        MotionEvent.ACTION_UP -> {
-                            val consume = mIsYamfGesture
-                            if (consume && isInZone && mCurrentTaskId != -1) {
-                                AndroidAppHelper.currentApplication().sendBroadcast(
-                                    Intent(YAMFManager.ACTION_OPEN_IN_YAMF).apply {
-                                        setPackage("android")
-                                        putExtra(YAMFManager.EXTRA_TASK_ID, mCurrentTaskId)
-                                        putExtra(YAMFManager.EXTRA_SOURCE, YAMFManager.SOURCE_RECENT)
-                                    }
-                                )
-                            }
-                            mMainHandler.post { mDropZoneView?.visibility = View.GONE }
-                            mIsShowingZone = false
-                            mIsYamfGesture = false
-                            mIsPotentialSwipeUp = false
-                            mCurrentTaskId = -1
-                            if (consume) param.result = null
+                        MotionEvent.ACTION_UP -> if (mIsPotentialSwipeUp) {
+                            nativeTransition.setCommit(nativeTransition.isFullyInside(mDropZoneRect))
+                            hideDropZone()
+                            resetGestureTracking(false)
                         }
-
-                        MotionEvent.ACTION_CANCEL -> {
-                            val consume = mIsYamfGesture
-                            mMainHandler.post { mDropZoneView?.visibility = View.GONE }
-                            mIsShowingZone = false
-                            mIsYamfGesture = false
-                            mIsPotentialSwipeUp = false
-                            mCurrentTaskId = -1
-                            if (consume) param.result = null
+                        MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_POINTER_DOWN -> if (mIsPotentialSwipeUp) {
+                            nativeTransition.setCommit(false)
+                            hideDropZone()
+                            resetGestureTracking(false)
                         }
                     }
-                }
-
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    mSyntheticCancelEvent?.let { cancelEvent ->
-                        if (param.args[0] === cancelEvent) {
-                            cancelEvent.recycle()
-                            mSyntheticCancelEvent = null
-                        }
-                    }
+                    // Quickstep always receives the complete stream. Non-target release
+                    // therefore finishes its stock overview animation.
                 }
             })
 
             findMethod(tisClass) { name == "onDestroy" }.hookBefore {
-                // log(TAG, "TouchInteractionService#onDestroy hooked")
-                mMainHandler.post {
-                    val context = it.thisObject as android.app.Service
-                    val windowManager =
-                        context.getSystemService(android.content.Context.WINDOW_SERVICE) as WindowManager
-                    mDropZoneView?.let { view ->
-                        try {
-                            windowManager.removeView(view)
-                            // log(TAG, "Removed mDropZoneView from WindowManager")
-                        } catch (e: Exception) {
-                            log(TAG, "Error removing drop zone view", e)
-                        }
-                        mDropZoneView = null
-                    }
-                }
+                nativeTransition.abort()
+                resetGestureTracking(removeZone = true)
             }
         }
 
@@ -382,6 +250,8 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 val activity = it.thisObject as Activity
                 val application = activity.application
                 application.registerReceiver(ACTION_RECEIVE_LAUNCHER_CONFIG) { _, intent ->
+                    gestureWindowWidth = intent.getIntExtra(EXTRA_WINDOW_WIDTH, 280)
+                    gestureWindowHeight = intent.getIntExtra(EXTRA_WINDOW_HEIGHT, 380)
                     val hookRecent = intent.getBooleanExtra(EXTRA_HOOK_RECENT, false)
                     val hookTaskbar = intent.getBooleanExtra(EXTRA_HOOK_TASKBAR, false)
                     val hookPopup = intent.getBooleanExtra(EXTRA_HOOK_POPUP, false)
@@ -553,23 +423,45 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
         // log(TAG, "hooking transient taskbar ${lpparam.packageName}")
     }
 
-    private fun updateDropZoneColor(isInZone: Boolean) {
+    private fun showDropZone(context: android.content.Context) {
         mMainHandler.post {
-            mDropZoneView?.let { view ->
-                val baseColor = if (isInZone) Color.parseColor("#8061d4ff") else Color.parseColor("#30FFFFFF")
-                val shape = ShapeDrawable(RoundRectShape(floatArrayOf(40f, 40f, 40f, 40f, 40f, 40f, 40f, 40f), null, null))
-                shape.paint.apply {
-                    color = baseColor
-                    style = Paint.Style.FILL_AND_STROKE
-                    strokeWidth = 8f
-                    pathEffect = DashPathEffect(floatArrayOf(20f, 15f), 0f)
-                }
-                view.background = shape
-                if (view is TextView) {
-                    view.alpha = if (isInZone) 1.0f else 0.8f
-                }
+            if (mDropZoneView != null) return@post
+            val wm = context.getSystemService(android.content.Context.WINDOW_SERVICE) as WindowManager
+            val view = WindowDropZoneView(context)
+            val lp = WindowManager.LayoutParams().apply {
+                type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                format = PixelFormat.TRANSLUCENT
+                flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                width = mDropZoneRect.width()
+                height = mDropZoneRect.height()
+                gravity = Gravity.TOP or Gravity.END
             }
+            runCatching { wm.addView(view, lp) }.onSuccess {
+                mDropZoneView = view
+                mDropZoneWindowManager = wm
+            }.onFailure { log(TAG, "Unable to show window drop zone", it) }
         }
+    }
+
+    private fun updateDropZone(highlighted: Boolean) {
+        mMainHandler.post { mDropZoneView?.highlighted = highlighted }
+    }
+
+    private fun hideDropZone() {
+        mMainHandler.post {
+            val view = mDropZoneView ?: return@post
+            mDropZoneView = null
+            runCatching { if (view.isAttachedToWindow) mDropZoneWindowManager?.removeViewImmediate(view) }
+            mDropZoneWindowManager = null
+        }
+    }
+
+    private fun resetGestureTracking(removeZone: Boolean) {
+        mIsPotentialSwipeUp = false
+        mCurrentTaskId = -1
+        if (removeZone) hideDropZone()
     }
 
     private fun extractComponentInfo(input: String): ComponentName? {
