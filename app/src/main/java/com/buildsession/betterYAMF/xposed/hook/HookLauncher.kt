@@ -218,19 +218,30 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                             val upward = mStartY - correctedY
                             val progress = (upward / (mScreenHeight * .60f)).coerceIn(0f, 1f)
                             val paused = nativeTransition.isMotionPaused()
-                            if (paused && progress >= .08f) showDropZone(context)
+                            // Do not wait for Quickstep's internal pause callback.
+                            // That callback can arrive several frames late (and on
+                            // landscape it is especially inconsistent), which left
+                            // the task card playing a canned animation instead of
+                            // following the finger. A clear upward + rightward
+                            // intent is enough to take ownership of the leash.
+                            val rightIntent = correctedX - mStartX > mScreenWidth * .025f
+                            val allowClaim = paused || (progress >= .08f && rightIntent)
+                            if (allowClaim && progress >= .08f) showDropZone(context)
                             nativeTransition.update(
                                 progress,
                                 correctedX - mStartX,
-                                paused,
-                                dropZoneProximity(correctedX, correctedY)
+                                allowClaim,
+                                dropZoneProximity(correctedX, correctedY),
+                                correctedX,
+                                correctedY
                             )
                             updateDropZone(nativeTransition.claimed &&
                                 isInDropZone(correctedX, correctedY))
                         }
                         MotionEvent.ACTION_UP -> if (mIsPotentialSwipeUp) {
+                            val closeToDropZone = dropZoneProximity(correctedX, correctedY) >= .45f
                             nativeTransition.setCommit(nativeTransition.claimed &&
-                                isInDropZone(correctedX, correctedY))
+                                (isInDropZone(correctedX, correctedY) || closeToDropZone))
                             hideDropZone()
                             resetGestureTracking(false)
                         }

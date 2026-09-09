@@ -42,6 +42,8 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
         var visualProgress = 0f
         var desiredProgress = 0f
         var lastProgressNanos = 0L
+        var claimFingerX = 0f
+        var claimFingerY = 0f
         var animator: ValueAnimator? = null
         var framePending = false
         val rect = RectF(0f, 0f, width.toFloat(), height.toFloat())
@@ -139,7 +141,14 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
      * deliberately separate from gesture progress: the window should only be
      * magnetised after the pointer is genuinely close to the corner target.
      */
-    fun update(progress: Float, dx: Float, allowClaim: Boolean, proximity: Float = 0f) {
+    fun update(
+        progress: Float,
+        dx: Float,
+        allowClaim: Boolean,
+        proximity: Float = 0f,
+        fingerX: Float = Float.NaN,
+        fingerY: Float = Float.NaN
+    ) {
         val s = session ?: return
         if (s.ending) return
         if (!s.claimed) {
@@ -150,18 +159,26 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
             if (progress < .08f || dx < s.width * .025f) return
             readSystemRect(s)?.let(s.claimStart::set)
             s.rect.set(s.claimStart)
+            s.claimFingerX = fingerX.takeIf { it.isFinite() } ?: (s.width * .5f)
+            s.claimFingerY = fingerY.takeIf { it.isFinite() } ?: (s.height * .5f)
             s.claimed = true
         }
-        // Let the live task follow both axes. A paused horizontal steer must continue
-        // the same transformation instead of waiting for another vertical swipe.
-        val verticalP = ((progress - .08f) / .62f).coerceIn(0f, 1f)
-        val horizontalP = ((dx / s.width - .025f) / .42f).coerceIn(0f, 1f)
-        // HyperOS treats this as one continuous route: the upward motion
-        // prepares the handoff, then rightward steering progressively hands
-        // control to the corner. This avoids the old centre -> corner jump.
-        val lateralEase = horizontalP * horizontalP * (3f - 2f * horizontalP)
-        val routeP = (verticalP * (.08f + .78f * lateralEase) + horizontalP * .14f)
-            .coerceIn(0f, .84f)
+        // Follow the actual finger path instead of replaying a canned vertical
+        // animation. Project the pointer onto the vector from the claim point to
+        // the upper-right target. This is continuous in portrait and landscape,
+        // and naturally keeps a straight-up swipe in Recents instead of dragging
+        // the card toward the corner.
+        val routeDx = s.width.toFloat() - s.claimFingerX
+        val routeDy = -s.claimFingerY
+        val pointerDx = (fingerX - s.claimFingerX).takeIf { it.isFinite() } ?: dx
+        val pointerDy = (fingerY - s.claimFingerY).takeIf { it.isFinite() } ?: -(progress * s.height)
+        val routeLength2 = routeDx * routeDx + routeDy * routeDy
+        val projection = if (routeLength2 > 1f) {
+            ((pointerDx * routeDx + pointerDy * routeDy) / routeLength2).coerceIn(0f, 1f)
+        } else 0f
+        // Keep a small headroom for the final magnetic settle so release never
+        // appears to teleport the leash into the corner.
+        val routeP = projection.coerceIn(0f, .94f)
         val near = proximity.coerceIn(0f, 1f)
         // Smootherstep gives zero velocity at both ends of the magnetic band,
         // matching the soft "glide then dock" feel of HyperOS.
@@ -205,7 +222,9 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
             s.visualProgress = s.desiredProgress
             return false
         }
-        val responseMs = if (delta > 0f) 145f else 95f
+        // A short response keeps the leash under the finger; only the final
+        // magnetic band should feel eased rather than delayed.
+        val responseMs = if (delta > 0f) 52f else 78f
         val blend = 1f - exp(-dtMs / responseMs)
         s.visualProgress += delta * blend
         return true
