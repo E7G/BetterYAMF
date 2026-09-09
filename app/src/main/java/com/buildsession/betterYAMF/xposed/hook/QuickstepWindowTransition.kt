@@ -16,8 +16,6 @@ import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import com.buildsession.betterYAMF.xposed.utils.log
-import kotlin.math.abs
-import kotlin.math.exp
 
 /** Uses Quickstep's existing remote-animation leash, never a task screenshot or an overlay.
  * Only a stream explicitly claimed by HookLauncher may change the stock handler's behavior.
@@ -40,14 +38,14 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
         var claimed = false
         var ending = false
         var visualProgress = 0f
-        var desiredProgress = 0f
-        var lastProgressNanos = 0L
+        var claimProgress = 0f
         var claimFingerX = 0f
         var claimFingerY = 0f
         var animator: ValueAnimator? = null
         var framePending = false
         val rect = RectF(0f, 0f, width.toFloat(), height.toFloat())
         val claimStart = RectF(rect)
+        val followRect = RectF(rect)
         val destination = RectF().apply {
             val w = (contentWidthDp * density).toInt().toFloat()
             val h = (contentHeightDp * density).toInt().toFloat()
@@ -157,35 +155,63 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
             // intention. Waiting for the recents card to fully settle makes
             // the handoff visibly jump from the centre of the screen.
             if (progress < .08f || dx < s.width * .025f) return
-            readSystemRect(s)?.let(s.claimStart::set)
+            val systemRect = readSystemRect(s)
+            if (systemRect != null && isUsableSystemRect(s, systemRect)) {
+                s.claimStart.set(systemRect)
+            } else {
+                // Some Quickstep builds expose getCurrentRect in the natural
+                // display rotation. Using it in landscape is what caused the
+                // centre -> lower-right -> upper-right jump. A near-fullscreen
+                // fallback is visually continuous at our early claim point.
+                val fallbackScale = 1f - progress.coerceIn(0f, .18f) * .22f
+                val w = s.width * fallbackScale
+                val h = s.height * fallbackScale
+                s.claimStart.set(
+                    (s.width - w) * .5f,
+                    (s.height - h) * .5f - progress * s.height * .08f,
+                    (s.width + w) * .5f,
+                    (s.height + h) * .5f - progress * s.height * .08f
+                )
+            }
             s.rect.set(s.claimStart)
+            s.followRect.set(s.claimStart)
+            s.claimProgress = progress
             s.claimFingerX = fingerX.takeIf { it.isFinite() } ?: (s.width * .5f)
             s.claimFingerY = fingerY.takeIf { it.isFinite() } ?: (s.height * .5f)
             s.claimed = true
         }
-        // Follow the actual finger path instead of replaying a canned vertical
-        // animation. Project the pointer onto the vector from the claim point to
-        // the upper-right target. This is continuous in portrait and landscape,
-        // and naturally keeps a straight-up swipe in Recents instead of dragging
-        // the card toward the corner.
-        val routeDx = s.width.toFloat() - s.claimFingerX
-        val routeDy = -s.claimFingerY
-        val pointerDx = (fingerX - s.claimFingerX).takeIf { it.isFinite() } ?: dx
-        val pointerDy = (fingerY - s.claimFingerY).takeIf { it.isFinite() } ?: -(progress * s.height)
-        val routeLength2 = routeDx * routeDx + routeDy * routeDy
-        val projection = if (routeLength2 > 1f) {
-            ((pointerDx * routeDx + pointerDy * routeDy) / routeLength2).coerceIn(0f, 1f)
-        } else 0f
-        // Keep a small headroom for the final magnetic settle so release never
-        // appears to teleport the leash into the corner.
-        val routeP = projection.coerceIn(0f, .94f)
-        val near = proximity.coerceIn(0f, 1f)
-        // Smootherstep gives zero velocity at both ends of the magnetic band,
-        // matching the soft "glide then dock" feel of HyperOS.
-        val magneticP = near * near * near * (near * (near * 6f - 15f) + 10f)
-        s.desiredProgress = maxOf(routeP, magneticP)
-        advanceVisualProgress(s)
-        updateRect(s)
+
+        val x = fingerX.takeIf { it.isFinite() } ?: (s.claimFingerX + dx)
+        val y = fingerY.takeIf { it.isFinite() }
+            ?: (s.claimFingerY - (progress - s.claimProgress) * s.height * .60f)
+        val pointerDx = x - s.claimFingerX
+        val pointerDy = y - s.claimFingerY
+
+        // Direct manipulation: every MOVE places the leash from the current
+        // pointer coordinates. There is deliberately no time-based animator or
+        // projected route here, so reversing or pausing the finger is reflected
+        // in the very next frame.
+        val extraUp = (s.claimFingerY - y).coerceAtLeast(0f)
+        val shrinkP = (extraUp / (s.height * .52f)).coerceIn(0f, 1f)
+        val w = lerp(s.claimStart.width(), s.destination.width(), shrinkP)
+        val h = lerp(s.claimStart.height(), s.destination.height(), shrinkP)
+        val centerX = s.claimStart.centerX() + pointerDx
+        val centerY = s.claimStart.centerY() + pointerDy
+        s.followRect.set(centerX - w * .5f, centerY - h * .5f,
+            centerX + w * .5f, centerY + h * .5f)
+
+        // Magnetism is spatial, not an animation. It starts only inside the
+        // narrow attraction band and blends from the finger-following rect,
+        // avoiding the old hard switch to a fixed corner trajectory.
+        val magneticInput = ((proximity.coerceIn(0f, 1f) - .35f) / .65f).coerceIn(0f, 1f)
+        val magneticP = smootherStep(magneticInput)
+        s.rect.set(
+            lerp(s.followRect.left, s.destination.left, magneticP),
+            lerp(s.followRect.top, s.destination.top, magneticP),
+            lerp(s.followRect.right, s.destination.right, magneticP),
+            lerp(s.followRect.bottom, s.destination.bottom, magneticP)
+        )
+        s.visualProgress = maxOf(progress, shrinkP, magneticP).coerceIn(0f, 1f)
         scheduleApply(s)
     }
 
@@ -198,45 +224,28 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
         s.framePending = true
         Choreographer.getInstance().postFrameCallback {
             s.framePending = false
-            if (session === s) {
-                if (!s.ending && s.claimed) {
-                    val moving = advanceVisualProgress(s)
-                    updateRect(s)
-                    apply(s)
-                    if (moving) scheduleApply(s)
-                } else {
-                    apply(s)
-                }
-            }
+            if (session === s) apply(s)
         }
     }
 
-    /** Critically-damped handoff: no discontinuity when magnetic target engages. */
-    private fun advanceVisualProgress(s: Session): Boolean {
-        val now = System.nanoTime()
-        val dtMs = if (s.lastProgressNanos == 0L) 16f
-        else ((now - s.lastProgressNanos) / 1_000_000f).coerceIn(1f, 32f)
-        s.lastProgressNanos = now
-        val delta = s.desiredProgress - s.visualProgress
-        if (abs(delta) < .001f) {
-            s.visualProgress = s.desiredProgress
-            return false
-        }
-        // A short response keeps the leash under the finger; only the final
-        // magnetic band should feel eased rather than delayed.
-        val responseMs = if (delta > 0f) 52f else 78f
-        val blend = 1f - exp(-dtMs / responseMs)
-        s.visualProgress += delta * blend
-        return true
-    }
+    private fun lerp(from: Float, to: Float, progress: Float) = from + (to - from) * progress
 
-    private fun updateRect(s: Session) {
-        val p = s.visualProgress.coerceIn(0f, 1f)
-        val w = s.claimStart.width() + (s.destination.width() - s.claimStart.width()) * p
-        val h = s.claimStart.height() + (s.destination.height() - s.claimStart.height()) * p
-        val left = s.claimStart.left + (s.destination.left - s.claimStart.left) * p
-        val top = s.claimStart.top + (s.destination.top - s.claimStart.top) * p
-        s.rect.set(left, top, left + w, top + h)
+    private fun smootherStep(value: Float): Float =
+        value * value * value * (value * (value * 6f - 15f) + 10f)
+
+    private fun isUsableSystemRect(s: Session, rect: RectF): Boolean {
+        if (!rect.left.isFinite() || !rect.top.isFinite() ||
+            !rect.right.isFinite() || !rect.bottom.isFinite() || rect.isEmpty) return false
+        if (rect.width() > s.width * 1.25f || rect.height() > s.height * 1.25f) return false
+        if (rect.centerX() !in -s.width * .10f..s.width * 1.10f ||
+            rect.centerY() !in -s.height * .10f..s.height * 1.10f) return false
+        // Reject the natural-rotation rectangle returned by affected landscape
+        // launchers. Accept square-ish values because split/letterboxed apps can
+        // legitimately differ from the display aspect ratio.
+        val screenLandscape = s.width > s.height
+        val rectStronglyLandscape = rect.width() > rect.height() * 1.15f
+        val rectStronglyPortrait = rect.height() > rect.width() * 1.15f
+        return if (screenLandscape) !rectStronglyPortrait else !rectStronglyLandscape
     }
 
     private fun apply(s: Session) {
