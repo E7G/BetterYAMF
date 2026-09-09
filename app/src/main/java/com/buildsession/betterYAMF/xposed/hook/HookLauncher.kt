@@ -58,6 +58,7 @@ import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.lang.reflect.Proxy
 import kotlin.math.min
+import kotlin.math.hypot
 
 
 class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
@@ -218,7 +219,12 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                             val progress = (upward / (mScreenHeight * .60f)).coerceIn(0f, 1f)
                             val paused = nativeTransition.isMotionPaused()
                             if (paused && progress >= .10f) showDropZone(context)
-                            nativeTransition.update(progress, correctedX - mStartX, paused)
+                            nativeTransition.update(
+                                progress,
+                                correctedX - mStartX,
+                                paused,
+                                dropZoneProximity(correctedX, correctedY)
+                            )
                             updateDropZone(nativeTransition.claimed &&
                                 isInDropZone(correctedX, correctedY))
                         }
@@ -465,6 +471,18 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
         val dx = mScreenWidth - x
         val radius = mDropZoneRect.width().toFloat()
         return dx * dx + y * y <= radius * radius
+    }
+
+    /** Soft attraction band around the quarter-circle target. */
+    private fun dropZoneProximity(x: Float, y: Float): Float {
+        val radius = mDropZoneRect.width().toFloat()
+        if (radius <= 0f) return 0f
+        val distance = hypot(mScreenWidth - x, y)
+        // Do not pull from the middle of the screen: attraction begins only
+        // just outside the quarter-circle and ramps over a short final band.
+        val start = radius * 1.12f
+        val range = radius * .30f
+        return ((start - distance) / range).coerceIn(0f, 1f)
     }
 
     private fun hideDropZone() {

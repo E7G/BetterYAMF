@@ -276,14 +276,12 @@ class AppWindow(
             when (rotation) {
                 Surface.ROTATION_0, Surface.ROTATION_180 -> {
                     orientation = 0
-                    binding.rlBarControllerSide.isVisible = false
                     // Center horizontally, use config.portraitY if set, else center vertically with offset
                     x = (screenWidth - windowWidth) / 2
                     y = if (config.portraitY != 0) config.portraitY else (screenHeight - windowHeight) / 2 - 80.dpToPx().toInt()
                 }
                 Surface.ROTATION_90, Surface.ROTATION_270 -> {
                     orientation = 1
-                    binding.rlBarControllerBottom.isVisible = false
                     // Center horizontally, use config.landscapeY if set, else center vertically
                     x = (screenWidth - windowWidth) / 2
                     y = if (config.landscapeY != 0) config.landscapeY else (screenHeight - windowHeight) / 2
@@ -300,6 +298,11 @@ class AppWindow(
                 y = 24.dpToPx().toInt().coerceAtMost((screenHeight - windowHeight).coerceAtLeast(0))
             }
         }
+
+        // HyperOS keeps the white resize handle under the window in every
+        // orientation.  The old landscape side handle was visually noisy and
+        // could end up outside the rotated content bounds.
+        updateBarControllerVisibility()
 
 
         paramsBg = WindowManager.LayoutParams(
@@ -352,14 +355,8 @@ class AppWindow(
                 isResize = false
 
                 binding.cvappIcon.visibility = View.INVISIBLE
-                if (orientation == 0) {
-                    animateAlpha(binding.rlBarControllerBottom, 1f, 0f) {
-                        binding.rlBarControllerBottom.visibility = View.GONE
-                    }
-                } else {
-                    animateAlpha(binding.rlBarControllerSide, 1f, 0f) {
-                        binding.rlBarControllerSide.visibility = View.GONE
-                    }
+                animateAlpha(binding.rlBarControllerBottom, 1f, 0f) {
+                    binding.rlBarControllerBottom.visibility = View.GONE
                 }
 
                 animateScaleThenResize(
@@ -382,14 +379,8 @@ class AppWindow(
                 isResize = false
 
                 binding.cvappIcon.visibility = View.INVISIBLE
-                if (orientation == 0) {
-                    animateAlpha(binding.rlBarControllerBottom, 1f, 0f) {
-                        binding.rlBarControllerBottom.visibility = View.GONE
-                    }
-                } else {
-                    animateAlpha(binding.rlBarControllerSide, 1f, 0f) {
-                        binding.rlBarControllerSide.visibility = View.GONE
-                    }
+                animateAlpha(binding.rlBarControllerBottom, 1f, 0f) {
+                    binding.rlBarControllerBottom.visibility = View.GONE
                 }
 
                 animateScaleThenResize(
@@ -608,14 +599,8 @@ class AppWindow(
             isResize = false
 
             binding.cvappIcon.visibility = View.INVISIBLE
-            if (orientation == 0) {
-                animateAlpha(binding.rlBarControllerBottom, 1f, 0f) {
-                    binding.rlBarControllerBottom.visibility = View.GONE
-                }
-            } else {
-                animateAlpha(binding.rlBarControllerSide, 1f, 0f) {
-                    binding.rlBarControllerSide.visibility = View.GONE
-                }
+            animateAlpha(binding.rlBarControllerBottom, 1f, 0f) {
+                binding.rlBarControllerBottom.visibility = View.GONE
             }
 
             animateScaleThenResize(
@@ -776,10 +761,15 @@ class AppWindow(
         bindingLeftBackGesture.root.visibility = if (showGestures) View.VISIBLE else View.GONE
         bindingRightBackGesture.root.visibility = if (showGestures) View.VISIBLE else View.GONE
 
-        if (!isMini && !isCollapsed) {
-            binding.rlBarControllerBottom.visibility = if (orientation == 0) View.VISIBLE else View.GONE
-            binding.rlBarControllerSide.visibility = if (orientation == 1) View.VISIBLE else View.GONE
-        }
+        updateBarControllerVisibility()
+    }
+
+    /** Keep the resize affordance below the content, including landscape. */
+    private fun updateBarControllerVisibility() {
+        if (!::binding.isInitialized) return
+        val show = !isMini && !isCollapsed
+        binding.rlBarControllerBottom.visibility = if (show) View.VISIBLE else View.GONE
+        binding.rlBarControllerSide.visibility = View.GONE
     }
 
     fun onDestroy() {
@@ -985,14 +975,8 @@ class AppWindow(
                 height = surfaceWidth
             }
 
-            // Update bar controllers visibility
-            if (orientation == 0) { // Portrait
-                binding.rlBarControllerSide.isVisible = false
-                binding.rlBarControllerBottom.isVisible = true
-            } else { // Landscape
-                binding.rlBarControllerSide.isVisible = true
-                binding.rlBarControllerBottom.isVisible = false
-            }
+            // Keep the handle below the window after rotation as well.
+            updateBarControllerVisibility()
             
             // Rotation callback can precede new display metrics and WRAP_CONTENT layout.
             // Re-clamp over several frames with bounds corrected for this rotation.
@@ -1208,13 +1192,7 @@ class AppWindow(
                 setBackgroundWrapContent()
                 setParrentWrapContent()
                 keepInScreen()
-                if (orientation == 0) {
-                    binding.rlBarControllerBottom.visibility = View.VISIBLE
-                    binding.rlBarControllerSide.visibility = View.GONE
-                } else {
-                    binding.rlBarControllerSide.visibility = View.VISIBLE
-                    binding.rlBarControllerBottom.visibility = View.GONE
-                }
+                updateBarControllerVisibility()
             } else {
                 binding.cvBackground.updateLayoutParams {
                     width = originalWidth
@@ -1237,11 +1215,7 @@ class AppWindow(
             }
 
             binding.ibRightResize.visibility = View.VISIBLE
-            if (orientation == 0) {
-                binding.rlBarControllerBottom.visibility = View.VISIBLE
-            } else {
-                binding.rlBarControllerSide.visibility = View.VISIBLE
-            }
+            updateBarControllerVisibility()
             restoreSurfaceInteraction()
 
             return
@@ -1321,11 +1295,7 @@ class AppWindow(
             animateResizeCentered(binding.cvBackground, 0, originalWidth, 0, originalHeight) {
                 setBackgroundWrapContent()
                 setParrentWrapContent()
-                if (orientation == 0) {
-                    binding.rlBarControllerBottom.visibility = View.VISIBLE
-                } else {
-                    binding.rlBarControllerSide.visibility = View.VISIBLE
-                }
+                updateBarControllerVisibility()
 
                 binding.cvappIcon.visibility = View.GONE
                 isResize = true

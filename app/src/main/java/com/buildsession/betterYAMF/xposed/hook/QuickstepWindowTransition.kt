@@ -130,7 +130,12 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
             .getOrDefault(false)
     }
 
-    fun update(progress: Float, dx: Float, allowClaim: Boolean) {
+    /**
+     * Update the live leash while the user steers the gesture.  `proximity` is
+     * deliberately separate from gesture progress: the window should only be
+     * magnetised after the pointer is genuinely close to the corner target.
+     */
+    fun update(progress: Float, dx: Float, allowClaim: Boolean, proximity: Float = 0f) {
         val s = session ?: return
         if (s.ending) return
         if (!s.claimed) {
@@ -144,9 +149,13 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
         // the same transformation instead of waiting for another vertical swipe.
         val verticalP = ((progress - .12f) / .50f).coerceIn(0f, 1f)
         val horizontalP = ((dx / s.width - .055f) / .50f).coerceIn(0f, 1f)
-        val rawP = maxOf(verticalP, horizontalP)
-        // HyperOS uses a soft ease-out: no jump when claiming, then a quick settle.
-        val p = rawP * rawP * (3f - 2f * rawP)
+        // Keep the leash close to the user's finger during the approach.  The
+        // corner destination only starts pulling once proximity reports that
+        // the pointer is inside the target's attraction band.
+        val approachP = minOf(.16f, maxOf(verticalP * .25f, horizontalP * .12f))
+        val near = proximity.coerceIn(0f, 1f)
+        val magneticP = near * near * (3f - 2f * near)
+        val p = maxOf(approachP, magneticP)
         s.visualProgress = p
         val w = s.claimStart.width() + (s.destination.width() - s.claimStart.width()) * p
         val h = s.claimStart.height() + (s.destination.height() - s.claimStart.height()) * p
@@ -223,8 +232,8 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
         val from = RectF(s.rect)
         val to = if (s.commit) s.destination else RectF(0f, 0f, s.width.toFloat(), s.height.toFloat())
         s.animator = ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = if (s.commit) 240 else 180
-            interpolator = PathInterpolator(.16f, .84f, .24f, 1f)
+            duration = if (s.commit) 320 else 220
+            interpolator = PathInterpolator(.20f, .75f, .30f, 1f)
             addUpdateListener {
                 val p = it.animatedValue as Float
                 s.rect.set(from.left + (to.left - from.left) * p, from.top + (to.top - from.top) * p,
