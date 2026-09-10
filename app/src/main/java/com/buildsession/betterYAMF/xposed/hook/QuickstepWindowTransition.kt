@@ -28,7 +28,7 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
     val claimed: Boolean get() = session?.claimed == true
 
     private class Session(val taskId: Int, val width: Int, val height: Int, val density: Float,
-        contentWidthDp: Int, contentHeightDp: Int, topInset: Int) {
+        contentWidthDp: Int, contentHeightDp: Int, val topInset: Int) {
         var handler: Any? = null
         var controller: Any? = null
         var target: Any? = null
@@ -40,6 +40,8 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
         var claimProgress = 0f
         var claimFingerX = 0f
         var claimFingerY = 0f
+        var grabRatioX = .5f
+        var grabRatioY = 1f
         var animator: ValueAnimator? = null
         var framePending = false
         val rect = RectF(0f, 0f, width.toFloat(), height.toFloat())
@@ -177,6 +179,14 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
             s.claimProgress = progress
             s.claimFingerX = fingerX.takeIf { it.isFinite() } ?: (s.width * .5f)
             s.claimFingerY = fingerY.takeIf { it.isFinite() } ?: (s.height * .5f)
+            // Preserve the real grab point instead of assuming every gesture
+            // starts at bottom-centre. Ratios are allowed slightly outside the
+            // task bounds because the finger commonly sits below the system
+            // card when Quickstep hands its leash to us.
+            s.grabRatioX = ((s.claimFingerX - s.claimStart.left) /
+                s.claimStart.width()).coerceIn(-.35f, 1.35f)
+            s.grabRatioY = ((s.claimFingerY - s.claimStart.top) /
+                s.claimStart.height()).coerceIn(-.25f, 1.50f)
             s.claimed = true
             // Once this stream belongs to YAMF, Overview must not be allowed to
             // peek through behind the live app leash—not even for the first
@@ -187,21 +197,43 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
         val x = fingerX.takeIf { it.isFinite() } ?: (s.claimFingerX + dx)
         val y = fingerY.takeIf { it.isFinite() }
             ?: (s.claimFingerY - (progress - s.claimProgress) * s.height * .60f)
-        val pointerDx = x - s.claimFingerX
-        val pointerDy = y - s.claimFingerY
-
         // Direct manipulation: every MOVE places the leash from the current
-        // pointer coordinates. There is deliberately no time-based animator or
-        // projected route here, so reversing or pausing the finger is reflected
-        // in the very next frame.
+        // pointer coordinates and the actual place where the user grabbed it.
+        // Scaling the original grab offset with the shrinking window keeps an
+        // off-centre swipe close to the finger instead of preserving a large,
+        // fixed screen-space gap.
         val extraUp = (s.claimFingerY - y).coerceAtLeast(0f)
         val shrinkP = (extraUp / (s.height * .52f)).coerceIn(0f, 1f)
         val w = lerp(s.claimStart.width(), s.destination.width(), shrinkP)
         val h = lerp(s.claimStart.height(), s.destination.height(), shrinkP)
-        val centerX = s.claimStart.centerX() + pointerDx
-        val centerY = s.claimStart.centerY() + pointerDy
-        s.followRect.set(centerX - w * .5f, centerY - h * .5f,
-            centerX + w * .5f, centerY + h * .5f)
+
+        // HyperOS-like edge response: movement stays fully direct until the
+        // window reaches the top/right boundary. Continued pressure then
+        // changes the grab pivot smoothly, making the finger travel from the
+        // lower part of the window toward its upper-right rather than dragging
+        // the entire surface off-screen.
+        val rawLeft = x - s.grabRatioX * w
+        val rawTop = y - s.grabRatioY * h
+        val edgeRange = maxOf(48f * s.density, minOf(w, h) * .20f)
+        val topContact = ((s.topInset - rawTop) / edgeRange).coerceIn(0f, 1f)
+        val rightContact = ((rawLeft + w - s.width) / edgeRange).coerceIn(0f, 1f)
+        val edgeGrabX = lerp(s.grabRatioX, .90f, smootherStep(rightContact))
+        val edgeGrabY = lerp(s.grabRatioY, .10f, smootherStep(topContact))
+        s.followRect.set(
+            x - edgeGrabX * w,
+            y - edgeGrabY * h,
+            x + (1f - edgeGrabX) * w,
+            y + (1f - edgeGrabY) * h
+        )
+
+        // Keep the complete surface inside the usable display while retaining
+        // the edge-pivot response above.
+        val minLeft = if (w <= s.width) 0f else s.width - w
+        val minTop = if (h <= s.height - s.topInset) s.topInset.toFloat() else s.height - h
+        if (s.followRect.left < minLeft) s.followRect.offset(minLeft - s.followRect.left, 0f)
+        if (s.followRect.right > s.width) s.followRect.offset(s.width - s.followRect.right, 0f)
+        if (s.followRect.top < minTop) s.followRect.offset(0f, minTop - s.followRect.top)
+        if (s.followRect.bottom > s.height) s.followRect.offset(0f, s.height - s.followRect.bottom)
 
         // Magnetism is spatial, not an animation. It starts only inside the
         // narrow attraction band and blends from the finger-following rect,
