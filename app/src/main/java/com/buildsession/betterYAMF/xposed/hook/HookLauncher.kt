@@ -86,6 +86,8 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
     private var mCurrentTaskId = -1
     private var mDropZoneView: WindowDropZoneView? = null
     private var mDropZoneWindowManager: WindowManager? = null
+    @Volatile private var mDropZoneEpoch = 0
+    private var mDropZoneWatchdog: Runnable? = null
     private var nativeAvailable = false
     // Rotation may restore Quickstep's cached Overview state after the normal
     // configuration callback. Keep a short-lived cleanup flag for that window.
@@ -229,7 +231,6 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                             // intent is enough to take ownership of the leash.
                             val rightIntent = correctedX - mStartX > mScreenWidth * .025f
                             val allowClaim = paused || (progress >= .08f && rightIntent)
-                            if (allowClaim && progress >= .08f) showDropZone(context)
                             nativeTransition.update(
                                 progress,
                                 correctedX - mStartX,
@@ -238,6 +239,9 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                                 correctedX,
                                 correctedY
                             )
+                            // Only expose the target after the native leash is ours. This
+                            // prevents a launcher-owned gesture from leaving the corner UI up.
+                            if (nativeTransition.claimed) showDropZone(context)
                             updateDropZone(nativeTransition.claimed &&
                                 isInDropZone(correctedX, correctedY))
                         }
@@ -347,6 +351,7 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
     }
 
     private fun forceLauncherNormal(launcher: Any) {
+        closeLauncherFloatingViews(launcher)
         runCatching {
             val manager = runCatching { XposedHelpers.callMethod(launcher, "getStateManager") }
                 .getOrElse { XposedHelpers.getObjectField(launcher, "mStateManager") }
@@ -362,6 +367,18 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
         // only updated the target state asynchronously.
         runCatching { XposedHelpers.callMethod(launcher, "onBackPressed") }
             .onFailure { log(TAG, "Unable to dismiss Launcher overview after rotation", it) }
+    }
+
+    private fun closeLauncherFloatingViews(launcher: Any) {
+        runCatching {
+            val floatingView = XposedHelpers.findClass(
+                "com.android.launcher3.AbstractFloatingView", launcher.javaClass.classLoader
+            )
+            XposedHelpers.callStaticMethod(floatingView, "closeAllOpenViews", launcher, false)
+        }.recoverCatching {
+            // Older Launcher3 branches expose the same operation on Launcher itself.
+            XposedHelpers.callMethod(launcher, "closeOpenViews", false)
+        }.onFailure { log(TAG, "Unable to close Launcher floating views", it) }
     }
 
     private fun hookRecent(lpparam: XC_LoadPackage.LoadPackageParam) {
@@ -507,7 +524,10 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
     }
 
     private fun showDropZone(context: android.content.Context) {
+        val epoch = mDropZoneEpoch
         mMainHandler.post {
+            if (epoch != mDropZoneEpoch) return@post
+            scheduleDropZoneWatchdog(epoch)
             if (mDropZoneView != null) return@post
             val wm = context.getSystemService(android.content.Context.WINDOW_SERVICE) as WindowManager
             val view = WindowDropZoneView(context)
@@ -527,6 +547,10 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 gravity = Gravity.TOP or Gravity.END
             }
             runCatching { wm.addView(view, lp) }.onSuccess {
+                if (epoch != mDropZoneEpoch) {
+                    runCatching { wm.removeViewImmediate(view) }
+                    return@onSuccess
+                }
                 mDropZoneView = view
                 mDropZoneWindowManager = wm
                 view.animate().alpha(1f).scaleX(1f).scaleY(1f)
@@ -535,6 +559,13 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                     .start()
             }.onFailure { log(TAG, "Unable to show window drop zone", it) }
         }
+    }
+
+    private fun scheduleDropZoneWatchdog(epoch: Int) {
+        mDropZoneWatchdog?.let(mMainHandler::removeCallbacks)
+        mDropZoneWatchdog = Runnable {
+            if (epoch == mDropZoneEpoch) hideDropZone()
+        }.also { mMainHandler.postDelayed(it, 700L) }
     }
 
     private fun updateDropZone(highlighted: Boolean) {
@@ -561,11 +592,18 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
     }
 
     private fun hideDropZone() {
+        // Invalidate show requests synchronously. ACTION_UP/CANCEL can otherwise
+        // race an already-posted MOVE and add the overlay after cleanup ran.
+        mDropZoneEpoch++
         mMainHandler.post {
+            mDropZoneWatchdog?.let(mMainHandler::removeCallbacks)
+            mDropZoneWatchdog = null
             val view = mDropZoneView ?: return@post
             mDropZoneView = null
-            runCatching { if (view.isAttachedToWindow) mDropZoneWindowManager?.removeViewImmediate(view) }
+            val wm = mDropZoneWindowManager
             mDropZoneWindowManager = null
+            view.animate().cancel()
+            runCatching { wm?.removeViewImmediate(view) }
         }
     }
 

@@ -356,6 +356,7 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
         release(s, restoreRecents = !commit)
         runCatching {
             val done = Runnable {
+                if (commit) clearLauncherUi(s)
                 runCatching { handler?.let { XposedHelpers.callMethod(it, "reset") } }
                 if (commit && handler != null) runCatching {
                     val container = XposedHelpers.getObjectField(handler, "mContainer")
@@ -364,7 +365,11 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
                     XposedHelpers.callMethod(manager, "goToState", XposedHelpers.getStaticObjectField(state, "NORMAL"), false)
                 }
                 if (commit) onCommit(s.taskId)
-                if (commit) main.postDelayed({ s.recents?.alpha = s.recentsAlpha }, 140L)
+                if (commit) main.postDelayed({
+                    // Restore only the reusable view's opacity after its task/menu
+                    // state has been reset and Launcher is back in NORMAL.
+                    s.recents?.alpha = s.recentsAlpha
+                }, 220L)
             }
             if (controller != null) finishController(controller, commit, done)
             else done.run()
@@ -404,6 +409,28 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
             s.recentsAlpha = recents.alpha
         }
         recents?.alpha = 0f
+    }
+
+    private fun clearLauncherUi(s: Session) {
+        val recents = s.recents ?: s.handler?.let {
+            runCatching { XposedHelpers.getObjectField(it, "mRecentsView") as? View }.getOrNull()
+        }
+        // TaskMenuView and related dropdowns are AbstractFloatingViews. Close them
+        // before resetting RecentsView so no detached menu survives the transition.
+        recents?.context?.let { context ->
+            runCatching {
+                val floatingView = XposedHelpers.findClass(
+                    "com.android.launcher3.AbstractFloatingView",
+                    s.handler?.javaClass?.classLoader ?: context.javaClass.classLoader
+                )
+                XposedHelpers.callStaticMethod(floatingView, "closeAllOpenViews", context, false)
+            }.recoverCatching {
+                XposedHelpers.callMethod(context, "closeOpenViews", false)
+            }.onFailure { log(HookLauncher.TAG, "Unable to close stale task menu", it) }
+        }
+        recents?.alpha = 0f
+        runCatching { recents?.let { XposedHelpers.callMethod(it, "reset") } }
+            .onFailure { log(HookLauncher.TAG, "Unable to reset stale overview UI", it) }
     }
 
     private fun release(s: Session, restoreRecents: Boolean = true) {
