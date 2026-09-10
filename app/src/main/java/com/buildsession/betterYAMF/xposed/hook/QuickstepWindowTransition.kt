@@ -37,7 +37,6 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
         var commit = false
         var claimed = false
         var ending = false
-        var visualProgress = 0f
         var claimProgress = 0f
         var claimFingerX = 0f
         var claimFingerY = 0f
@@ -179,6 +178,10 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
             s.claimFingerX = fingerX.takeIf { it.isFinite() } ?: (s.width * .5f)
             s.claimFingerY = fingerY.takeIf { it.isFinite() } ?: (s.height * .5f)
             s.claimed = true
+            // Once this stream belongs to YAMF, Overview must not be allowed to
+            // peek through behind the live app leash—not even for the first
+            // claimed frame.
+            hideRecents(s)
         }
 
         val x = fingerX.takeIf { it.isFinite() } ?: (s.claimFingerX + dx)
@@ -211,7 +214,6 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
             lerp(s.followRect.right, s.destination.right, magneticP),
             lerp(s.followRect.bottom, s.destination.bottom, magneticP)
         )
-        s.visualProgress = maxOf(progress, shrinkP, magneticP).coerceIn(0f, 1f)
         scheduleApply(s)
     }
 
@@ -251,14 +253,7 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
     private fun apply(s: Session) {
         if (session !== s || !s.claimed) return
         runCatching {
-            val recents = s.handler?.let { XposedHelpers.getObjectField(it, "mRecentsView") } as? View
-            if (s.recents == null && recents != null) {
-                s.recents = recents
-                s.recentsAlpha = recents.alpha
-            }
-            // Keep the launcher at app-state progress, suppress only its overview view.
-            val fadeP = (s.visualProgress / .30f).coerceIn(0f, 1f)
-            recents?.alpha = s.recentsAlpha * (1f - fadeP * fadeP * (3f - 2f * fadeP))
+            hideRecents(s)
             val target = s.target ?: return
             val leash = XposedHelpers.getObjectField(target, "leash") as SurfaceControl
             if (!leash.isValid) return
@@ -323,7 +318,10 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
         if (session !== s) return
         val controller = s.controller
         val handler = s.handler
-        release(s)
+        // On commit keep Recents hidden until Quickstep has actually returned
+        // Launcher to NORMAL. Restoring it here caused a one-frame Overview
+        // flash immediately before the YAMF window appeared.
+        release(s, restoreRecents = !commit)
         runCatching {
             val done = Runnable {
                 runCatching { handler?.let { XposedHelpers.callMethod(it, "reset") } }
@@ -334,11 +332,13 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
                     XposedHelpers.callMethod(manager, "goToState", XposedHelpers.getStaticObjectField(state, "NORMAL"), false)
                 }
                 if (commit) onCommit(s.taskId)
+                if (commit) main.postDelayed({ s.recents?.alpha = s.recentsAlpha }, 140L)
             }
             if (controller != null) finishController(controller, commit, done)
             else done.run()
         }.onFailure {
             log(HookLauncher.TAG, "Unable to finish native transition", it)
+            s.recents?.alpha = s.recentsAlpha
             runCatching { handler?.let { XposedHelpers.callMethod(it, "onGestureCancelled") } }
         }
     }
@@ -363,12 +363,23 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
         withReason.invoke(controller, toHome, done, reason)
     }
 
-    private fun release(s: Session) {
+    private fun hideRecents(s: Session) {
+        val recents = s.handler?.let {
+            runCatching { XposedHelpers.getObjectField(it, "mRecentsView") as? View }.getOrNull()
+        }
+        if (s.recents == null && recents != null) {
+            s.recents = recents
+            s.recentsAlpha = recents.alpha
+        }
+        recents?.alpha = 0f
+    }
+
+    private fun release(s: Session, restoreRecents: Boolean = true) {
         if (session !== s) return
         session = null
         s.animator?.removeAllListeners()
         s.animator?.cancel()
-        s.recents?.alpha = s.recentsAlpha
+        if (restoreRecents) s.recents?.alpha = s.recentsAlpha
         s.transaction.close()
     }
 }
