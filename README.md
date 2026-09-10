@@ -48,9 +48,10 @@ A performance-focused fork of [reYAMF](https://github.com/JuanArton/reYAMF), wit
 ```
 
 The installable debug APK is generated at `app/build/outputs/apk/debug/app-debug.apk`.
+The tagged GitHub release uses the signed `release` variant.
 
 ## GitHub Actions release
-Push a version tag to build, test, and publish an APK automatically:
+Push a version tag to build, test, sign, and publish an APK automatically:
 ```bash
 git tag v1.2.0
 git push origin v1.2.0
@@ -58,6 +59,10 @@ git push origin v1.2.0
 
 The workflow also uploads the APK as a workflow artifact. Running it manually from
 the **Actions** tab performs the same build and test steps without creating a release.
+
+Release signing is supplied by repository Actions secrets (`RELEASE_KEYSTORE_BASE64`,
+`RELEASE_STORE_PASSWORD`, `RELEASE_KEY_ALIAS`, and `RELEASE_KEY_PASSWORD`); the
+keystore is decoded only inside the ephemeral runner and is never committed.
 
 ## "API" 
 - Broadcast `com.buildsession.betterYAMF.action.CURRENT_TO_WINDOW` to float the currently visible app

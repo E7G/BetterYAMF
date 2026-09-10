@@ -39,10 +39,26 @@ android {
             )
         )
     }
+    // CI supplies a repository-kept keystore through environment variables.
+    // Local builds remain unchanged and can continue using the debug variant.
+    val ciKeystorePath = System.getenv("RELEASE_KEYSTORE_PATH")
+    if (!ciKeystorePath.isNullOrBlank()) {
+        signingConfigs {
+            create("ciRelease") {
+                storeFile = file(ciKeystorePath)
+                storePassword = System.getenv("RELEASE_STORE_PASSWORD")
+                keyAlias = System.getenv("RELEASE_KEY_ALIAS")
+                keyPassword = System.getenv("RELEASE_KEY_PASSWORD")
+            }
+        }
+    }
     buildTypes {
         release {
             isMinifyEnabled = false
             isShrinkResources = false
+            if (!System.getenv("RELEASE_KEYSTORE_PATH").isNullOrBlank()) {
+                signingConfig = signingConfigs.getByName("ciRelease")
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
