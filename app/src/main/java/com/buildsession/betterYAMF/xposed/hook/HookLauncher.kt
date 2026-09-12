@@ -180,6 +180,10 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
                     val context = AndroidAppHelper.currentApplication()
                     if (action == MotionEvent.ACTION_DOWN) {
+                        // A previous committed YAMF gesture may deliberately keep
+                        // Recents hidden until the next input stream. Restore it
+                        // before Quickstep starts handling that stream.
+                        nativeTransition.prepareForGesture()
                         updateDimensions(context)
                         val wm = context.getSystemService(android.content.Context.WINDOW_SERVICE) as WindowManager
                         mCurrentRotation = wm.defaultDisplay.rotation

@@ -25,6 +25,8 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
     // Xposed constructs entry points before the app's main Looper exists.
     private val main by lazy { Handler(Looper.getMainLooper()) }
     private var session: Session? = null
+    private var suppressedRecents: View? = null
+    private var suppressedRecentsAlpha = 1f
     val active: Boolean get() = session != null
     val claimed: Boolean get() = session?.claimed == true
     val targetReached: Boolean get() = session?.targetReached == true
@@ -248,6 +250,18 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
 
     fun abort() { session?.let(::restoreSystemGesture) }
 
+    /**
+     * A committed stream keeps Recents transparent while Launcher finishes its
+     * asynchronous state/remote-transition cleanup. Restoring it on a timer is
+     * racy: affected Launcher3 builds can still be laid out in OVERVIEW and
+     * expose detached task headers on the home screen. Restore it only when a
+     * new gesture actually needs Recents again.
+     */
+    fun prepareForGesture() {
+        suppressedRecents?.alpha = suppressedRecentsAlpha
+        suppressedRecents = null
+    }
+
     private fun scheduleApply(s: Session) {
         if (session !== s || s.framePending) return
         s.framePending = true
@@ -360,11 +374,6 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
                     XposedHelpers.callMethod(manager, "goToState", XposedHelpers.getStaticObjectField(state, "NORMAL"), false)
                 }
                 if (commit) onCommit(s.taskId)
-                if (commit) main.postDelayed({
-                    // Restore only the reusable view's opacity after its task/menu
-                    // state has been reset and Launcher is back in NORMAL.
-                    s.recents?.alpha = s.recentsAlpha
-                }, 220L)
             }
             if (controller != null) finishController(controller, commit, done)
             else done.run()
@@ -433,7 +442,15 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
         session = null
         s.animator?.removeAllListeners()
         s.animator?.cancel()
-        if (restoreRecents) s.recents?.alpha = s.recentsAlpha
+        if (restoreRecents) {
+            s.recents?.alpha = s.recentsAlpha
+        } else {
+            s.recents?.let {
+                suppressedRecents = it
+                suppressedRecentsAlpha = s.recentsAlpha
+                it.alpha = 0f
+            }
+        }
         s.transaction.close()
     }
 }
