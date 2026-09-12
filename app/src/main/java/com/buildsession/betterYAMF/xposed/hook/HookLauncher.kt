@@ -58,7 +58,6 @@ import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.lang.reflect.Proxy
 import kotlin.math.min
-import kotlin.math.hypot
 
 
 class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
@@ -235,20 +234,18 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                                 progress,
                                 correctedX - mStartX,
                                 allowClaim,
-                                dropZoneProximity(correctedX, correctedY),
                                 correctedX,
                                 correctedY
                             )
                             // Only expose the target after the native leash is ours. This
                             // prevents a launcher-owned gesture from leaving the corner UI up.
                             if (nativeTransition.claimed) showDropZone(context)
-                            updateDropZone(nativeTransition.claimed &&
-                                isInDropZone(correctedX, correctedY))
+                            updateDropZone(nativeTransition.targetReached)
                         }
                         MotionEvent.ACTION_UP -> if (mIsPotentialSwipeUp) {
-                            val closeToDropZone = dropZoneProximity(correctedX, correctedY) >= .45f
-                            nativeTransition.setCommit(nativeTransition.claimed &&
-                                (isInDropZone(correctedX, correctedY) || closeToDropZone))
+                            nativeTransition.setCommit(
+                                nativeTransition.claimed && nativeTransition.targetReached
+                            )
                             hideDropZone()
                             resetGestureTracking(false)
                         }
@@ -570,25 +567,6 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
     private fun updateDropZone(highlighted: Boolean) {
         mMainHandler.post { mDropZoneView?.highlighted = highlighted }
-    }
-
-    private fun isInDropZone(x: Float, y: Float): Boolean {
-        if (!mDropZoneRect.contains(x.toInt(), y.toInt())) return false
-        val dx = mScreenWidth - x
-        val radius = mDropZoneRect.width().toFloat()
-        return dx * dx + y * y <= radius * radius
-    }
-
-    /** Soft attraction band around the quarter-circle target. */
-    private fun dropZoneProximity(x: Float, y: Float): Float {
-        val radius = mDropZoneRect.width().toFloat()
-        if (radius <= 0f) return 0f
-        val distance = hypot(mScreenWidth - x, y)
-        // Do not pull from the middle of the screen: attraction begins only
-        // just outside the quarter-circle and ramps over a short final band.
-        val start = radius * 1.12f
-        val range = radius * .30f
-        return ((start - distance) / range).coerceIn(0f, 1f)
     }
 
     private fun hideDropZone() {

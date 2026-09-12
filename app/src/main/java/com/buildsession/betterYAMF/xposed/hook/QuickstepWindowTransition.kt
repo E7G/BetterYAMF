@@ -16,6 +16,7 @@ import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import com.buildsession.betterYAMF.xposed.utils.log
+import kotlin.math.hypot
 
 /** Uses Quickstep's existing remote-animation leash, never a task screenshot or an overlay.
  * Only a stream explicitly claimed by HookLauncher may change the stock handler's behavior.
@@ -26,6 +27,7 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
     private var session: Session? = null
     val active: Boolean get() = session != null
     val claimed: Boolean get() = session?.claimed == true
+    val targetReached: Boolean get() = session?.targetReached == true
 
     private class Session(val taskId: Int, val width: Int, val height: Int, val density: Float,
         contentWidthDp: Int, contentHeightDp: Int, val topInset: Int) {
@@ -36,6 +38,7 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
         var recentsAlpha = 1f
         var commit = false
         var claimed = false
+        var targetReached = false
         var ending = false
         var claimProgress = 0f
         var claimFingerX = 0f
@@ -135,16 +138,11 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
             .getOrDefault(false)
     }
 
-    /**
-     * Update the live leash while the user steers the gesture.  `proximity` is
-     * deliberately separate from gesture progress: the window should only be
-     * magnetised after the pointer is genuinely close to the corner target.
-     */
+    /** The floating window itself, not the pointer, decides when the target is reached. */
     fun update(
         progress: Float,
         dx: Float,
         allowClaim: Boolean,
-        proximity: Float = 0f,
         fingerX: Float = Float.NaN,
         fingerY: Float = Float.NaN
     ) {
@@ -207,27 +205,17 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
         val w = lerp(s.claimStart.width(), s.destination.width(), shrinkP)
         val h = lerp(s.claimStart.height(), s.destination.height(), shrinkP)
 
-        // HyperOS-like edge response: movement stays fully direct until the
-        // window reaches the top/right boundary. Continued pressure then
-        // changes the grab pivot smoothly, making the finger travel from the
-        // lower part of the window toward its upper-right rather than dragging
-        // the entire surface off-screen.
-        val rawLeft = x - s.grabRatioX * w
-        val rawTop = y - s.grabRatioY * h
-        val edgeRange = maxOf(48f * s.density, minOf(w, h) * .20f)
-        val topContact = ((s.topInset - rawTop) / edgeRange).coerceIn(0f, 1f)
-        val rightContact = ((rawLeft + w - s.width) / edgeRange).coerceIn(0f, 1f)
-        val edgeGrabX = lerp(s.grabRatioX, .90f, smootherStep(rightContact))
-        val edgeGrabY = lerp(s.grabRatioY, .10f, smootherStep(topContact))
+        // Preserve the initial grab point for the whole gesture. The previous
+        // edge response moved it from the bottom to the top, making users push
+        // farther after the window had already reached the target area.
         s.followRect.set(
-            x - edgeGrabX * w,
-            y - edgeGrabY * h,
-            x + (1f - edgeGrabX) * w,
-            y + (1f - edgeGrabY) * h
+            x - s.grabRatioX * w,
+            y - s.grabRatioY * h,
+            x + (1f - s.grabRatioX) * w,
+            y + (1f - s.grabRatioY) * h
         )
 
-        // Keep the complete surface inside the usable display while retaining
-        // the edge-pivot response above.
+        // Keep the complete surface inside the usable display.
         val minLeft = if (w <= s.width) 0f else s.width - w
         val minTop = if (h <= s.height - s.topInset) s.topInset.toFloat() else s.height - h
         if (s.followRect.left < minLeft) s.followRect.offset(minLeft - s.followRect.left, 0f)
@@ -235,10 +223,17 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
         if (s.followRect.top < minTop) s.followRect.offset(0f, minTop - s.followRect.top)
         if (s.followRect.bottom > s.height) s.followRect.offset(0f, s.height - s.followRect.bottom)
 
-        // Magnetism is spatial, not an animation. It starts only inside the
-        // narrow attraction band and blends from the finger-following rect,
-        // avoiding the old hard switch to a fixed corner trajectory.
-        val magneticInput = ((proximity.coerceIn(0f, 1f) - .35f) / .65f).coerceIn(0f, 1f)
+        // Start magnetism when the window's top-right edge approaches the
+        // quarter-circle. The finger can stay lower on the window instead of
+        // reaching the physical top-right corner of the display.
+        val zoneRadius = 96f * s.density
+        val horizontalGap = (s.width - s.followRect.right).coerceAtLeast(0f)
+        val edgeDistance = hypot(horizontalGap, s.followRect.top.coerceAtLeast(0f))
+        val attractionStart = zoneRadius * 1.45f
+        val windowProximity = if (shrinkP < .42f) 0f else
+            ((attractionStart - edgeDistance) / (zoneRadius * .62f)).coerceIn(0f, 1f)
+        s.targetReached = windowProximity >= .45f
+        val magneticInput = ((windowProximity - .30f) / .70f).coerceIn(0f, 1f)
         val magneticP = smootherStep(magneticInput)
         s.rect.set(
             lerp(s.followRect.left, s.destination.left, magneticP),
