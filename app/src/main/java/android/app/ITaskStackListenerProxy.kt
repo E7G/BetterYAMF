@@ -11,6 +11,7 @@ import java.lang.reflect.Method
  */
 object ITaskStackListenerProxy {
     private class CallbackNames {
+        fun onTaskStackChanged() = Unit
         fun onTaskMovedToFront() = Unit
         fun onTaskDescriptionChanged() = Unit
         fun onTaskRemovalStarted() = Unit
@@ -19,6 +20,9 @@ object ITaskStackListenerProxy {
 
     private val movedMethod: Method by lazy {
         CallbackNames::class.java.getDeclaredMethod("onTaskMovedToFront")
+    }
+    private val stackChangedMethod: Method by lazy {
+        CallbackNames::class.java.getDeclaredMethod("onTaskStackChanged")
     }
     private val descriptionMethod: Method by lazy {
         CallbackNames::class.java.getDeclaredMethod("onTaskDescriptionChanged")
@@ -36,6 +40,10 @@ object ITaskStackListenerProxy {
         intercept: (Array<Any?>, Method) -> Any?
     ): ITaskStackListener {
         return object : TaskStackListener() {
+            override fun onTaskStackChanged() {
+                runCatching { intercept(emptyArray(), stackChangedMethod) }
+            }
+
             override fun onTaskMovedToFront(taskInfo: ActivityManager.RunningTaskInfo) {
                 runCatching { intercept(arrayOf(taskInfo), movedMethod) }
             }
@@ -45,8 +53,9 @@ object ITaskStackListenerProxy {
             }
 
             override fun onTaskRemovalStarted(taskInfo: ActivityManager.RunningTaskInfo) {
-                // Preserve the old BetterYAMF callback contract: the manager expects a taskId here.
-                runCatching { intercept(arrayOf(taskInfo.taskId), removalStartedMethod) }
+                // Keep displayId so removal can clean a virtual-display window
+                // even if task ownership raced the initial move callback.
+                runCatching { intercept(arrayOf(taskInfo), removalStartedMethod) }
             }
 
             override fun onTaskRemoved(taskId: Int) {

@@ -93,6 +93,11 @@ object YAMFManager : IYAMFManager.Stub() {
         android.app.ITaskStackListenerProxy.newInstance(Instances.systemContext.classLoader) { args, method ->
             runMain {
                 when (method.name) {
+                    "onTaskStackChanged" -> {
+                        activeWindows.values.toList().forEach {
+                            it.scheduleHostedTaskValidation(300L)
+                        }
+                    }
                     "onTaskMovedToFront" -> {
                         val taskInfo = args[0] as android.app.ActivityManager.RunningTaskInfo
                         activeWindows.values.toList().forEach { it.onTaskMovedToFront(taskInfo) }
@@ -121,17 +126,26 @@ object YAMFManager : IYAMFManager.Stub() {
                         activeWindows.values.toList().forEach { it.onTaskDescriptionChanged(taskInfo) }
                     }
                     "onTaskRemovalStarted", "onTaskRemoved" -> {
+                        val removalInfo = args.firstOrNull() as?
+                            android.app.ActivityManager.RunningTaskInfo
                         val taskId = when (val value = args.firstOrNull()) {
                             is Int -> value
                             is android.app.ActivityManager.RunningTaskInfo -> value.taskId
                             else -> return@runMain
                         }
+                        val removedDisplayId = removalInfo?.let {
+                            runCatching { XposedHelpers.getIntField(it, "displayId") }
+                                .getOrDefault(-1)
+                        } ?: -1
                         smoothFreeformTasks.remove(taskId)
                         smoothFreeformBounds.remove(taskId)
                         // 过滤：只有当被移除的任务 ID 确实属于某个小窗时才触发销
                         activeWindows.values.toList().forEach { window ->
-                            if (window.currentTaskId == taskId) {
+                            if (window.currentTaskId == taskId ||
+                                (removedDisplayId > 0 && window.displayId == removedDisplayId)) {
                                 window.onDestroy()
+                            } else {
+                                window.scheduleHostedTaskValidation(250L)
                             }
                         }
                     }
@@ -194,6 +208,9 @@ object YAMFManager : IYAMFManager.Stub() {
         }
 
         if (isNew) notifyOpenCountChanged()
+        // Startup can race task ownership callbacks. After the move settles,
+        // remove a virtual-display shell that never received a real task.
+        window.scheduleHostedTaskValidation(1800L)
     }
 
     private fun notifyOpenCountChanged() {

@@ -7,6 +7,7 @@ import android.os.RemoteException;
  * The real implementation is provided by the boot class path at runtime.
  */
 public class TaskStackListener extends ITaskStackListener.Stub {
+    public void onTaskStackChanged() throws RemoteException {}
     public void onTaskMovedToFront(ActivityManager.RunningTaskInfo taskInfo) throws RemoteException {}
     public void onTaskDescriptionChanged(ActivityManager.RunningTaskInfo taskInfo) throws RemoteException {}
     public void onTaskRemovalStarted(ActivityManager.RunningTaskInfo taskInfo) throws RemoteException {}

@@ -167,6 +167,7 @@ class AppWindow(
     private var isSuperShown = false
     private var cornerDropZoneView: CornerDropZoneView? = null
     private var currentHighlightedCorner = -1
+    private var hostedTaskValidationToken = 0
 
     private val broadcastReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -793,6 +794,7 @@ class AppWindow(
     fun onDestroy() {
         if (isDestroyed) return
         isDestroyed = true
+        hostedTaskValidationToken++
 
         mainScope.cancel()
         keepInScreenAnimator?.cancel()
@@ -945,6 +947,7 @@ class AppWindow(
                 return
             }
 
+            hostedTaskValidationToken++
             updateTask(taskInfo)
         }
     }
@@ -962,6 +965,36 @@ class AppWindow(
             }
             
             updateTask(taskInfo)
+        }
+    }
+
+    /**
+     * Remove a virtual-display shell after its hosted task disappears. Some ROMs
+     * omit onTaskRemoved after force-stop, or deliver it before currentTaskId is
+     * known, which previously left only the display's navigation handle visible.
+     */
+    fun scheduleHostedTaskValidation(delayMs: Long = 300L) {
+        if (isDestroyed || config.windowMode != 0 || displayId <= 0) return
+        val token = ++hostedTaskValidationToken
+        mainScope.launch {
+            delay(delayMs)
+            repeat(3) { pass ->
+                if (isDestroyed || token != hostedTaskValidationToken) return@launch
+                val hostedTask = runCatching {
+                    Instances.activityTaskManager.getAllRootTaskInfosOnDisplay(displayId)
+                        .firstOrNull { task ->
+                            task.taskId > 0 && task.numActivities > 0 &&
+                                (task.topActivity != null || task.baseActivity != null) &&
+                                !isHomeTask(task)
+                        }
+                }.getOrNull()
+                if (hostedTask != null) {
+                    currentTaskId = hostedTask.taskId
+                    return@launch
+                }
+                if (pass < 2) delay(350L)
+            }
+            if (!isDestroyed && token == hostedTaskValidationToken) onDestroy()
         }
     }
 
@@ -1361,7 +1394,7 @@ class AppWindow(
         }
     }
 
-    private fun isHomeTask(taskInfo: ActivityManager.RunningTaskInfo): Boolean {
+    private fun isHomeTask(taskInfo: Any): Boolean {
         val activityType = runCatching {
             val configuration = taskInfo.getObject("configuration")
             val windowConfig = configuration.getObject("windowConfiguration")
@@ -1369,7 +1402,13 @@ class AppWindow(
         }.getOrDefault(0)
         if (activityType == 2) return true // ACTIVITY_TYPE_HOME
 
-        val pkg = taskInfo.topActivity?.packageName ?: return false
+        val topActivity = runCatching {
+            taskInfo.getObject("topActivity") as? android.content.ComponentName
+        }.getOrNull()
+        val baseActivity = runCatching {
+            taskInfo.getObject("baseActivity") as? android.content.ComponentName
+        }.getOrNull()
+        val pkg = (topActivity ?: baseActivity)?.packageName ?: return false
         return pkg == homePackage || pkg == "com.android.launcher3" ||
             pkg == "com.google.android.apps.nexuslauncher" ||
             (pkg.contains("launcher", ignoreCase = true) &&
