@@ -210,7 +210,7 @@ object YAMFManager : IYAMFManager.Stub() {
         if (isNew) notifyOpenCountChanged()
         // Startup can race task ownership callbacks. After the move settles,
         // remove a virtual-display shell that never received a real task.
-        window.scheduleHostedTaskValidation(1800L)
+        window.startHostedTaskWatchdog()
     }
 
     private fun notifyOpenCountChanged() {

@@ -168,6 +168,7 @@ class AppWindow(
     private var cornerDropZoneView: CornerDropZoneView? = null
     private var currentHighlightedCorner = -1
     private var hostedTaskValidationToken = 0
+    private var hostedTaskWatchdogStarted = false
 
     private val broadcastReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -980,14 +981,7 @@ class AppWindow(
             delay(delayMs)
             repeat(3) { pass ->
                 if (isDestroyed || token != hostedTaskValidationToken) return@launch
-                val hostedTask = runCatching {
-                    Instances.activityTaskManager.getAllRootTaskInfosOnDisplay(displayId)
-                        .firstOrNull { task ->
-                            task.taskId > 0 && task.numActivities > 0 &&
-                                (task.topActivity != null || task.baseActivity != null) &&
-                                !isHomeTask(task)
-                        }
-                }.getOrNull()
+                val hostedTask = findHostedTask()
                 if (hostedTask != null) {
                     currentTaskId = hostedTask.taskId
                     return@launch
@@ -997,6 +991,40 @@ class AppWindow(
             if (!isDestroyed && token == hostedTaskValidationToken) onDestroy()
         }
     }
+
+    /** Low-frequency fallback for ROMs that never deliver task removal callbacks. */
+    fun startHostedTaskWatchdog() {
+        if (hostedTaskWatchdogStarted || isDestroyed || config.windowMode != 0 || displayId <= 0) return
+        hostedTaskWatchdogStarted = true
+        mainScope.launch {
+            delay(1800L)
+            var emptyChecks = 0
+            while (!isDestroyed) {
+                val hostedTask = findHostedTask()
+                if (hostedTask == null) {
+                    emptyChecks++
+                    if (emptyChecks >= 2) {
+                        onDestroy()
+                        return@launch
+                    }
+                    delay(350L)
+                } else {
+                    currentTaskId = hostedTask.taskId
+                    emptyChecks = 0
+                    delay(1200L)
+                }
+            }
+        }
+    }
+
+    private fun findHostedTask(): ActivityTaskManager.RootTaskInfo? = runCatching {
+        Instances.activityTaskManager.getAllRootTaskInfosOnDisplay(displayId)
+            .firstOrNull { task ->
+                task.taskId > 0 && task.numActivities > 0 &&
+                    (task.topActivity != null || task.baseActivity != null) &&
+                    !isHomeTask(task)
+            }
+    }.getOrNull()
 
     inner class RotationWatcher : IRotationWatcher.Stub() {
         override fun onRotationChanged(rotation: Int) {
