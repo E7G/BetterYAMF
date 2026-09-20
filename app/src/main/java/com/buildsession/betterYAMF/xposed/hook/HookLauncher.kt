@@ -83,7 +83,6 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
     private var mStartX = 0f
     private var mStartY = 0f
     private var mPauseConfirmed = false
-    private var mGestureLandscape = false
     private var mCurrentTaskId = -1
     private var mDropZoneView: WindowDropZoneView? = null
     private var mDropZoneWindowManager: WindowManager? = null
@@ -209,7 +208,6 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                             mStartY = correctedY
                             mCurrentTaskId = runCatching { captureTopTask(context) }.getOrDefault(-1)
                             val landscape = mScreenWidth > mScreenHeight
-                            mGestureLandscape = landscape
                             mPauseConfirmed = false
                             mIsPotentialSwipeUp = nativeAvailable && mCurrentTaskId != -1 && event.pointerCount == 1 &&
                                 correctedY > mScreenHeight * if (landscape) .90f else .94f
@@ -226,19 +224,13 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                             val upward = mStartY - correctedY
                             val progress = (upward / (mScreenHeight * .60f)).coerceIn(0f, 1f)
                             val paused = nativeTransition.isMotionPaused()
-                            // A fast swipe belongs to Home even if its path drifts
-                            // towards the upper-right corner. YAMF may take ownership
-                            // only after Quickstep has recognized a deliberate hold,
-                            // followed by a substantial rightward drag. Landscape gets
-                            // a wider dead zone because small horizontal hand jitter is
-                            // proportionally much easier to produce there.
                             if (paused) mPauseConfirmed = true
-                            val rightTravel = correctedX - mStartX
-                            val minRightTravel = mScreenWidth *
-                                if (mGestureLandscape) .11f else .075f
-                            val rightIntent = rightTravel >= minRightTravel &&
-                                rightTravel >= upward.coerceAtLeast(0f) * .14f
-                            val allowClaim = mPauseConfirmed && progress >= .16f && rightIntent
+                            // Preserve the original early leash hand-off and its
+                            // direct-manipulation animation. Motion pause is used
+                            // only as a commit gate on ACTION_UP, so it cannot alter
+                            // the window path or make the animation start late.
+                            val rightIntent = correctedX - mStartX > mScreenWidth * .025f
+                            val allowClaim = paused || (progress >= .08f && rightIntent)
                             nativeTransition.update(
                                 progress,
                                 correctedX - mStartX,
@@ -600,7 +592,6 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
         mIsPotentialSwipeUp = false
         mCurrentTaskId = -1
         mPauseConfirmed = false
-        mGestureLandscape = false
         if (removeZone) hideDropZone()
     }
 

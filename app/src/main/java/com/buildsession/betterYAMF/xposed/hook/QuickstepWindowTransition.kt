@@ -150,10 +150,9 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
         if (s.ending) return
         if (!s.claimed) {
             if (!allowClaim) return
-            // HookLauncher already requires Quickstep's motion-pause signal and
-            // orientation-specific lateral intent. Keep a small local guard for
-            // callers that do not pass through that policy.
-            if (progress < .16f || dx < s.width * .075f) return
+            // Claim at the original early threshold so the task keeps following
+            // the finger without a visible change in animation timing.
+            if (progress < .08f || dx < s.width * .025f) return
             val systemRect = readSystemRect(s)
             if (systemRect != null && isUsableSystemRect(s, systemRect)) {
                 s.claimStart.set(systemRect)
