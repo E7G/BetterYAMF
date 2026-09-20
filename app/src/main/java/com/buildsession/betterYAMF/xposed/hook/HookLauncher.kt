@@ -82,6 +82,7 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
     private var mScreenWidth = 0
     private var mStartX = 0f
     private var mStartY = 0f
+    private var mGestureDownTime = 0L
     private var mCurrentTaskId = -1
     private var mDropZoneView: WindowDropZoneView? = null
     private var mDropZoneWindowManager: WindowManager? = null
@@ -205,6 +206,7 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                             nativeTransition.abort()
                             mStartX = correctedX
                             mStartY = correctedY
+                            mGestureDownTime = event.eventTime
                             mCurrentTaskId = runCatching { captureTopTask(context) }.getOrDefault(-1)
                             val landscape = mScreenWidth > mScreenHeight
                             mIsPotentialSwipeUp = nativeAvailable && mCurrentTaskId != -1 && event.pointerCount == 1 &&
@@ -243,8 +245,18 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                             updateDropZone(nativeTransition.targetReached)
                         }
                         MotionEvent.ACTION_UP -> if (mIsPotentialSwipeUp) {
+                            val upward = mStartY - correctedY
+                            // Refresh the hit test at the release coordinates, but
+                            // never claim a previously unclaimed stream on UP.
+                            nativeTransition.update(
+                                (upward / (mScreenHeight * .60f)).coerceIn(0f, 1f),
+                                correctedX - mStartX, false, correctedX, correctedY
+                            )
                             nativeTransition.setCommit(
-                                nativeTransition.claimed && nativeTransition.targetReached
+                                nativeTransition.canCommit(
+                                    correctedX - mStartX, upward,
+                                    event.eventTime - mGestureDownTime
+                                )
                             )
                             hideDropZone()
                             resetGestureTracking(false)

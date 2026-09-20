@@ -246,6 +246,19 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
 
     fun setCommit(commit: Boolean) { session?.commit = commit }
 
+    fun canCommit(rightTravel: Float, upwardTravel: Float, durationMs: Long): Boolean {
+        val s = session ?: return false
+        if (!s.claimed || !s.targetReached) return false
+        val edgeDistance = hypot(
+            (s.width - s.followRect.right).coerceAtLeast(0f),
+            s.followRect.top.coerceAtLeast(0f)
+        )
+        return LandscapeWindowCommitPolicy.allows(
+            s.width, s.height, s.density, rightTravel, upwardTravel,
+            durationMs, edgeDistance, 96f * s.density
+        )
+    }
+
     fun abort() { session?.let(::restoreSystemGesture) }
 
     private fun scheduleApply(s: Session) {
