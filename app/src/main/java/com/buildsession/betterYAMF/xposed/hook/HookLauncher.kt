@@ -180,10 +180,6 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
                     val context = AndroidAppHelper.currentApplication()
                     if (action == MotionEvent.ACTION_DOWN) {
-                        // A previous committed YAMF gesture may deliberately keep
-                        // Recents hidden until the next input stream. Restore it
-                        // before Quickstep starts handling that stream.
-                        nativeTransition.prepareForGesture()
                         updateDimensions(context)
                         val wm = context.getSystemService(android.content.Context.WINDOW_SERVICE) as WindowManager
                         mCurrentRotation = wm.defaultDisplay.rotation
@@ -361,6 +357,7 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
             )
             XposedHelpers.callMethod(manager, "goToState",
                 XposedHelpers.getStaticObjectField(state, "NORMAL"), false)
+            LauncherOverviewCleanup.finishHome(launcher)
         }.onFailure { log(TAG, "Unable to restore Launcher normal state after rotation", it) }
         // AOSP/Quickstep may keep the RecentsView visible while a rotation
         // transition is settling.  Dispatching the same back action as the
