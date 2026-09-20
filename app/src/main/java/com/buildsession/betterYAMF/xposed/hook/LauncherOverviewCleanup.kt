@@ -10,25 +10,8 @@ internal object LauncherOverviewCleanup {
         // Use the stock state handlers, rather than leaving a transparent but
         // interactive task carousel behind Home. This also cancels the gesture's
         // pending property animator, which could otherwise resurrect the headers.
-        val manager = runCatching {
-            XposedHelpers.callMethod(launcher, "getStateManager")
-        }.getOrElse {
-            log(HookLauncher.TAG, "Unable to obtain Launcher state manager", it)
-            return
-        }
-        // Delayed cleanup catches the cross-display transition that follows a
-        // successful commit. Never close a real Overview gesture the user may
-        // have started meanwhile.
-        val isNormal = runCatching {
-            val launcherState = XposedHelpers.findClass(
-                "com.android.launcher3.LauncherState", launcher.javaClass.classLoader
-            )
-            XposedHelpers.callMethod(manager, "getState") ===
-                XposedHelpers.getStaticObjectField(launcherState, "NORMAL")
-        }.getOrDefault(true)
-        if (!isNormal) return
-
         runCatching {
+            val manager = XposedHelpers.callMethod(launcher, "getStateManager")
             XposedHelpers.callMethod(manager, "reapplyState", true)
         }.onFailure { log(HookLauncher.TAG, "Unable to reapply Launcher home state", it) }
 

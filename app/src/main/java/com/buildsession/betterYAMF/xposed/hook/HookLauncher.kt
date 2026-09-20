@@ -82,7 +82,6 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
     private var mScreenWidth = 0
     private var mStartX = 0f
     private var mStartY = 0f
-    private var mPauseConfirmed = false
     private var mCurrentTaskId = -1
     private var mDropZoneView: WindowDropZoneView? = null
     private var mDropZoneWindowManager: WindowManager? = null
@@ -208,7 +207,6 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                             mStartY = correctedY
                             mCurrentTaskId = runCatching { captureTopTask(context) }.getOrDefault(-1)
                             val landscape = mScreenWidth > mScreenHeight
-                            mPauseConfirmed = false
                             mIsPotentialSwipeUp = nativeAvailable && mCurrentTaskId != -1 && event.pointerCount == 1 &&
                                 correctedY > mScreenHeight * if (landscape) .90f else .94f
                             if (mIsPotentialSwipeUp) {
@@ -224,11 +222,12 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                             val upward = mStartY - correctedY
                             val progress = (upward / (mScreenHeight * .60f)).coerceIn(0f, 1f)
                             val paused = nativeTransition.isMotionPaused()
-                            if (paused) mPauseConfirmed = true
-                            // Preserve the original early leash hand-off and its
-                            // direct-manipulation animation. Motion pause is used
-                            // only as a commit gate on ACTION_UP, so it cannot alter
-                            // the window path or make the animation start late.
+                            // Do not wait for Quickstep's internal pause callback.
+                            // That callback can arrive several frames late (and on
+                            // landscape it is especially inconsistent), which left
+                            // the task card playing a canned animation instead of
+                            // following the finger. A clear upward + rightward
+                            // intent is enough to take ownership of the leash.
                             val rightIntent = correctedX - mStartX > mScreenWidth * .025f
                             val allowClaim = paused || (progress >= .08f && rightIntent)
                             nativeTransition.update(
@@ -245,8 +244,7 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         }
                         MotionEvent.ACTION_UP -> if (mIsPotentialSwipeUp) {
                             nativeTransition.setCommit(
-                                mPauseConfirmed && nativeTransition.claimed &&
-                                    nativeTransition.targetReached
+                                nativeTransition.claimed && nativeTransition.targetReached
                             )
                             hideDropZone()
                             resetGestureTracking(false)
@@ -591,7 +589,6 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
     private fun resetGestureTracking(removeZone: Boolean) {
         mIsPotentialSwipeUp = false
         mCurrentTaskId = -1
-        mPauseConfirmed = false
         if (removeZone) hideDropZone()
     }
 

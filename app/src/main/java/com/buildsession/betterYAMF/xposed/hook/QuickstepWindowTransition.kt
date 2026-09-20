@@ -150,8 +150,9 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
         if (s.ending) return
         if (!s.claimed) {
             if (!allowClaim) return
-            // Claim at the original early threshold so the task keeps following
-            // the finger without a visible change in animation timing.
+            // Claim as soon as the paused gesture has a clear rightward
+            // intention. Waiting for the recents card to fully settle makes
+            // the handoff visibly jump from the centre of the screen.
             if (progress < .08f || dx < s.width * .025f) return
             val systemRect = readSystemRect(s)
             if (systemRect != null && isUsableSystemRect(s, systemRect)) {
@@ -363,22 +364,6 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
                 }
                 if (commit) s.recents?.alpha = s.recentsAlpha
                 if (commit) onCommit(s.taskId)
-                if (commit && handler != null) {
-                    val launcher = runCatching {
-                        XposedHelpers.getObjectField(handler, "mContainer")
-                    }.getOrNull()
-                    if (launcher != null) {
-                        // Moving the task to its virtual display starts another
-                        // Shell transition which can reapply the old Overview
-                        // properties after the immediate cleanup. Reapply HOME
-                        // after that transition settles as well.
-                        for (delay in longArrayOf(90L, 280L, 720L)) {
-                            main.postDelayed({
-                                LauncherOverviewCleanup.finishHome(launcher, s.recents)
-                            }, delay)
-                        }
-                    }
-                }
             }
             if (controller != null) finishController(controller, commit, done)
             else done.run()
