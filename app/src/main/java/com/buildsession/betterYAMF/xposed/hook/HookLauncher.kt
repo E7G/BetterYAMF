@@ -82,6 +82,8 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
     private var mScreenWidth = 0
     private var mStartX = 0f
     private var mStartY = 0f
+    private var mPauseConfirmed = false
+    private var mGestureLandscape = false
     private var mCurrentTaskId = -1
     private var mDropZoneView: WindowDropZoneView? = null
     private var mDropZoneWindowManager: WindowManager? = null
@@ -207,6 +209,8 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                             mStartY = correctedY
                             mCurrentTaskId = runCatching { captureTopTask(context) }.getOrDefault(-1)
                             val landscape = mScreenWidth > mScreenHeight
+                            mGestureLandscape = landscape
+                            mPauseConfirmed = false
                             mIsPotentialSwipeUp = nativeAvailable && mCurrentTaskId != -1 && event.pointerCount == 1 &&
                                 correctedY > mScreenHeight * if (landscape) .90f else .94f
                             if (mIsPotentialSwipeUp) {
@@ -222,14 +226,19 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                             val upward = mStartY - correctedY
                             val progress = (upward / (mScreenHeight * .60f)).coerceIn(0f, 1f)
                             val paused = nativeTransition.isMotionPaused()
-                            // Do not wait for Quickstep's internal pause callback.
-                            // That callback can arrive several frames late (and on
-                            // landscape it is especially inconsistent), which left
-                            // the task card playing a canned animation instead of
-                            // following the finger. A clear upward + rightward
-                            // intent is enough to take ownership of the leash.
-                            val rightIntent = correctedX - mStartX > mScreenWidth * .025f
-                            val allowClaim = paused || (progress >= .08f && rightIntent)
+                            // A fast swipe belongs to Home even if its path drifts
+                            // towards the upper-right corner. YAMF may take ownership
+                            // only after Quickstep has recognized a deliberate hold,
+                            // followed by a substantial rightward drag. Landscape gets
+                            // a wider dead zone because small horizontal hand jitter is
+                            // proportionally much easier to produce there.
+                            if (paused) mPauseConfirmed = true
+                            val rightTravel = correctedX - mStartX
+                            val minRightTravel = mScreenWidth *
+                                if (mGestureLandscape) .11f else .075f
+                            val rightIntent = rightTravel >= minRightTravel &&
+                                rightTravel >= upward.coerceAtLeast(0f) * .14f
+                            val allowClaim = mPauseConfirmed && progress >= .16f && rightIntent
                             nativeTransition.update(
                                 progress,
                                 correctedX - mStartX,
@@ -244,7 +253,8 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         }
                         MotionEvent.ACTION_UP -> if (mIsPotentialSwipeUp) {
                             nativeTransition.setCommit(
-                                nativeTransition.claimed && nativeTransition.targetReached
+                                mPauseConfirmed && nativeTransition.claimed &&
+                                    nativeTransition.targetReached
                             )
                             hideDropZone()
                             resetGestureTracking(false)
@@ -589,6 +599,8 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
     private fun resetGestureTracking(removeZone: Boolean) {
         mIsPotentialSwipeUp = false
         mCurrentTaskId = -1
+        mPauseConfirmed = false
+        mGestureLandscape = false
         if (removeZone) hideDropZone()
     }
 

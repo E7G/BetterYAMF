@@ -150,10 +150,10 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
         if (s.ending) return
         if (!s.claimed) {
             if (!allowClaim) return
-            // Claim as soon as the paused gesture has a clear rightward
-            // intention. Waiting for the recents card to fully settle makes
-            // the handoff visibly jump from the centre of the screen.
-            if (progress < .08f || dx < s.width * .025f) return
+            // HookLauncher already requires Quickstep's motion-pause signal and
+            // orientation-specific lateral intent. Keep a small local guard for
+            // callers that do not pass through that policy.
+            if (progress < .16f || dx < s.width * .075f) return
             val systemRect = readSystemRect(s)
             if (systemRect != null && isUsableSystemRect(s, systemRect)) {
                 s.claimStart.set(systemRect)
