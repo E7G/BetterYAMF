@@ -34,6 +34,9 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
         var handler: Any? = null
         var controller: Any? = null
         var target: Any? = null
+        var leash: SurfaceControl? = null
+        var sourceWidth = 0
+        var sourceHeight = 0
         var recents: View? = null
         var recentsAlpha = 1f
         var commit = false
@@ -293,19 +296,27 @@ internal class QuickstepWindowTransition(private val onCommit: (Int) -> Unit) {
     private fun apply(s: Session) {
         if (session !== s || !s.claimed) return
         runCatching {
-            hideRecents(s)
+            // Quickstep may write alpha again while the gesture is running.
+            // Keep Overview hidden without reflecting mRecentsView every frame.
+            s.recents?.let { if (it.alpha != 0f) it.alpha = 0f }
             val target = s.target ?: return
-            val leash = XposedHelpers.getObjectField(target, "leash") as SurfaceControl
+            // RemoteAnimationTarget and its source bounds are fixed for this
+            // gesture; Xposed field lookups and RectF allocation are not.
+            val leash = s.leash ?: (XposedHelpers.getObjectField(target, "leash") as SurfaceControl)
+                .also { s.leash = it }
             if (!leash.isValid) return
-            val bounds = XposedHelpers.getObjectField(target, "screenSpaceBounds") as Rect
-            val source = RectF(0f, 0f, bounds.width().toFloat(), bounds.height().toFloat())
-            if (source.isEmpty) return
+            if (s.sourceWidth == 0 || s.sourceHeight == 0) {
+                val bounds = XposedHelpers.getObjectField(target, "screenSpaceBounds") as Rect
+                s.sourceWidth = bounds.width()
+                s.sourceHeight = bounds.height()
+            }
+            if (s.sourceWidth <= 0 || s.sourceHeight <= 0) return
             // Crop with a uniform scale, as system app transitions do. Non-uniform
             // FILL visibly stretches icons/text when landscape becomes a portrait window.
-            val scale = maxOf(s.rect.width() / source.width(), s.rect.height() / source.height())
-            val cropWidth = (s.rect.width() / scale).toInt().coerceIn(1, bounds.width())
-            val cropHeight = (s.rect.height() / scale).toInt().coerceIn(1, bounds.height())
-            val cropLeft = (bounds.width() - cropWidth) / 2
+            val scale = maxOf(s.rect.width() / s.sourceWidth, s.rect.height() / s.sourceHeight)
+            val cropWidth = (s.rect.width() / scale).toInt().coerceIn(1, s.sourceWidth)
+            val cropHeight = (s.rect.height() / scale).toInt().coerceIn(1, s.sourceHeight)
+            val cropLeft = (s.sourceWidth - cropWidth) / 2
             s.crop.set(cropLeft, 0, cropLeft + cropWidth, cropHeight)
             s.matrix.setScale(scale, scale)
             s.matrix.postTranslate(s.rect.left - cropLeft * scale, s.rect.top)

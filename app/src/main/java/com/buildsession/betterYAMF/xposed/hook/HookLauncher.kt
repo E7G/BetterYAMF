@@ -14,6 +14,7 @@ import android.graphics.drawable.Icon
 import android.os.Handler
 import android.os.Build
 import android.os.Looper
+import android.os.SystemClock
 import android.os.UserHandle
 import android.view.MotionEvent
 import android.view.Gravity
@@ -87,6 +88,9 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
     private var mDropZoneView: WindowDropZoneView? = null
     private var mDropZoneWindowManager: WindowManager? = null
     @Volatile private var mDropZoneEpoch = 0
+    @Volatile private var mDropZoneShowRequested = false
+    @Volatile private var mDropZoneLastMove = 0L
+    @Volatile private var mDropZoneHighlightRequested: Boolean? = null
     private var mDropZoneWatchdog: Runnable? = null
     private var nativeAvailable = false
     // Rotation may restore Quickstep's cached Overview state after the normal
@@ -534,6 +538,11 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
     }
 
     private fun showDropZone(context: android.content.Context) {
+        mDropZoneLastMove = SystemClock.uptimeMillis()
+        // MOVE may arrive more often than the display refresh rate. Do not enqueue
+        // a window operation and a watchdog reset for every input sample.
+        if (mDropZoneShowRequested) return
+        mDropZoneShowRequested = true
         val epoch = mDropZoneEpoch
         mMainHandler.post {
             if (epoch != mDropZoneEpoch) return@post
@@ -574,18 +583,28 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
     private fun scheduleDropZoneWatchdog(epoch: Int) {
         mDropZoneWatchdog?.let(mMainHandler::removeCallbacks)
         mDropZoneWatchdog = Runnable {
-            if (epoch == mDropZoneEpoch) hideDropZone()
+            if (epoch != mDropZoneEpoch) return@Runnable
+            val idle = SystemClock.uptimeMillis() - mDropZoneLastMove
+            if (idle >= 700L) hideDropZone()
+            else mDropZoneWatchdog?.let { mMainHandler.postDelayed(it, 700L - idle) }
         }.also { mMainHandler.postDelayed(it, 700L) }
     }
 
     private fun updateDropZone(highlighted: Boolean) {
-        mMainHandler.post { mDropZoneView?.highlighted = highlighted }
+        if (mDropZoneHighlightRequested == highlighted) return
+        mDropZoneHighlightRequested = highlighted
+        val epoch = mDropZoneEpoch
+        mMainHandler.post {
+            if (epoch == mDropZoneEpoch) mDropZoneView?.highlighted = highlighted
+        }
     }
 
     private fun hideDropZone() {
         // Invalidate show requests synchronously. ACTION_UP/CANCEL can otherwise
         // race an already-posted MOVE and add the overlay after cleanup ran.
         mDropZoneEpoch++
+        mDropZoneShowRequested = false
+        mDropZoneHighlightRequested = null
         mMainHandler.post {
             mDropZoneWatchdog?.let(mMainHandler::removeCallbacks)
             mDropZoneWatchdog = null
